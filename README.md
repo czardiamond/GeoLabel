@@ -1,74 +1,102 @@
-What the Project Does
-Manual geospatial annotation for computer vision models (building extraction, solar PV detection, maritime tracking) is notoriously time-consuming and prone to human labeling errors.
+# GeoLabel — Specialist Geospatial Annotation Platform & Python SDK
 
-Interactive Annotation Studio is a full-featured, human-in-the-loop geospatial labeling and quality assurance platform designed for AI engineers and GIS annotators. It combines AI-assisted pre-labeling with precision vector drawing tools, real-time spatial analytics, and automated SLA audit scoring to accelerate dataset preparation for satellite computer vision pipelines.
+GeoLabel is a two-sided marketplace for human-in-the-loop specialist geospatial data annotation (building footprints, solar PV, SAR radar feature extraction, land cover vectorization).
 
-Key Features:
-AI-Assisted Pre-Labeling ("Suggest AI"): Generates predicted bounding boxes and multi-class polygon masks using vision transformer models for rapid verification and manual adjustment.
+This repository contains the complete **FastAPI Backend REST Server** and the **Official Python Client SDK** (`geolabel-sdk`), along with deployment manifests for **Railway** and **Render**.
 
-Multi-Modal Labeling Modes:
+---
 
-Vector BBox & Polygon Layering: Orthogonal snapping, vertex handle editing, and vertex locking.
+## 🚀 Quick Start (Local Backend & Python SDK)
 
-10×10 Semantic Segmentation: Pixel-grid brush painting for fine-grained coverage (roofs, water, solar, vegetation).
+### 1. Install Dependencies & Start FastAPI Server
+```bash
+# Install backend & SDK requirements
+pip install -r requirements.txt
+pip install -e .
 
-4×4 Grid Land-Use Classification: Macro-tile land-use categorization with real-time class assignments.
+# Run local FastAPI backend on http://localhost:8000
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+```
+Interactive OpenAPI documentation will be accessible at `http://localhost:8000/docs`.
 
-Real-Time Annotation Summary Sidebar: Live spatial statistics calculating total labeled area (
-), percentage of satellite tile coverage, class object counts, and AI confidence distribution.
+### 2. Execute Python SDK Against Backend
+```python
+from geolabel_sdk import GeoLabelClient
 
-Density Heatmap Overlay: Visualizes spatial label density and identifies high-risk QA inspection zones.
+# Initialize client
+client = GeoLabelClient(
+    api_key="gl_live_secret_key_12345",
+    base_url="http://localhost:8000"
+)
 
-Automated Senior SLA Audit Engine: Instant compliance scoring against ground-truth benchmarks for overlap detection, coordinate fidelity, and boundary completeness.
+# 1. Create an Annotation Task
+task = client.tasks.create(
+    raster_uri="s3://earth-observation-data/sentinel2_tile_34T.tif",
+    crs="EPSG:32634",
+    taxonomy=["building_footprint", "solar_pv"],
+    target_annotator_count=2,
+    webhook_url="https://api.mycompany.ai/webhooks/geolabel-complete"
+)
+print(f"Task Queued: {task.id} | Initial Status: {task.status()}")
 
-Multi-Format Machine Learning Export: Native export to GeoJSON, COCO JSON, YOLO (.txt), and CSV.
+# 2. Simulate Specialist Annotators Submitting Work (End-to-End Test)
+task.simulate_completion()
 
-How to Use It
+# 3. Check Updated Task Status & Inter-Annotator Agreement (IAA)
+print(f"Updated Status: {task.current_status}")
+print(f"Inter-Annotator Agreement Score ({task.iaa_type}): {task.iaa_score}")
 
-1. Select Task Mode & Satellite Tile
-Choose a Task Mode from the top header:
+# 4. Download Completed Annotations as GeoJSON
+results = task.download_results(format="geojson", filename="completed_buildings.geojson")
+print(f"Downloaded {results['annotation_count']} vector feature collections!")
+```
 
-Bounding Box / Polygon Detection (for object-level feature mapping)
+---
 
-Semantic Segmentation (for 10×10 grid pixel painting)
+## ☁️ Deploying Backend to Railway or Render
 
-Grid Classification (for 4×4 macro land-use tagging)
+The backend relies on **SQLite by default** (simple, file-based, zero extra infrastructure) but uses SQLAlchemy ORM so you can swap in **PostgreSQL** anytime simply by supplying `DATABASE_URL=postgresql://user:pass@host/dbname`.
 
-Load Satellite Tiles: Click the tile selector or open the Batch Task Queue Manager (Q) to switch locations (e.g., Dubai Palm Jumeirah, Rotterdam Port Container Terminal, Amazon Canopy).
+### Option A: Railway Deployment
+1. Connect your GitHub repository to [Railway.app](https://railway.app).
+2. Railway auto-detects `railway.json` and `Procfile`.
+3. Set the following Environment Variables in Railway Dashboard:
+   - `GEOLABEL_API_KEY`: Set your secret bearer key (e.g. `gl_live_8923a1098b...`)
+   - `DATABASE_URL`: `sqlite:///./geolabel.db` (or attach a Railway Postgres database)
+4. Click **Deploy**. Your app will publish on `https://<your-app>.up.railway.app`.
 
-2. Generate & Edit Annotations
-AI Pre-Labeling: Click "Suggest Annotations (GeoAI)" in the top toolbar or right sidebar. The system automatically populates predicted vector masks for instant review.
+### Option B: Render Deployment
+1. Go to [Render.com](https://render.com) -> New -> Web Service.
+2. Select your repository. Render automatically reads `render.yaml`.
+3. Verify settings:
+   - **Environment**: Python 3
+   - **Build Command**: `pip install -r requirements.txt`
+   - **Start Command**: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
+4. Set Environment Variables:
+   - `GEOLABEL_API_KEY`: Set your secret API key.
+   - `DATABASE_URL`: `sqlite:///./geolabel.db`
+5. Click **Create Web Service**. Your live backend URL will be `https://<your-service>.onrender.com`.
 
-Manual Vector Drawing:
+---
 
-Select Polygon (P) or BBox (B) tool.
+## 🛠️ REST API Specification
 
-Click on the canvas to place coordinates.
+| Endpoint | Method | Description | Auth Header |
+| :--- | :--- | :--- | :--- |
+| `/health` | `GET` | Health check probe | None |
+| `/tasks` | `POST` | Ingest new annotation task | `Authorization: Bearer <key>` |
+| `/tasks/{id}` | `GET` | Retrieve task status & metadata | `Authorization: Bearer <key>` |
+| `/tasks/{id}/results` | `GET` | Download GeoJSON vectors + IAA score | `Authorization: Bearer <key>` |
+| `/tasks/{id}/webhook` | `POST` | Register callback webhook URL | `Authorization: Bearer <key>` |
+| `/tasks/{id}/annotations` | `POST` | Submit human specialist annotation | `Authorization: Bearer <key>` |
+| `/tasks/{id}/simulate-completion` | `POST` | End-to-end simulation helper | `Authorization: Bearer <key>` |
 
-Enable Ortho Snapping (O) for clean 90° architectural corners on buildings and solar arrays.
+---
 
-Click existing vertices to tweak shapes, drag corners, or lock layers (L).
+## 📋 Out-of-Scope Roadmap & Explicit TODOs
 
-3. Monitor Real-Time Spatial Analytics
-Open the Annotation Summary sidebar tab on the right:
-
-Labeled Area: Tracks total square meters (
-) annotated in real-time.
-
-Tile Coverage: Displays the percentage of the satellite tile mapped.
-
-Class Breakdown: Monitors object counts and surface coverage per label class (Building Roofs, Solar PV, Cargo Vessels, Vegetation Canopy, etc.).
-
-Toggle the Density Heatmap (H) overlay to spot label density clusters and unannotated gaps.
-
-4. Run Quality Audit & Export Datasets
-Run Senior Audit: Click "Submit for Senior Audit Scoring" to evaluate your annotations against precision SLA rulesets and receive instant score feedback (Pass, Escalate, or Fail).
-
-Export Machine-Ready Datasets:
-
-Switch to the Deliverable Payload tab or click "Export Sample".
-
-Choose your target format: GeoJSON, COCO, YOLO, or CSV.
-
-Copy the live payload directly to your clipboard or download the dataset file for model training.
-
+To keep the system honest and transparent:
+1. **Automated Computer Vision Models**: Annotation is strictly human-in-the-loop (specialist annotators). Automated ML models are not included by design.
+2. **True SLA Guarantee Logic**: Turnaround time metrics reflect historical specialist pod averages; contractual SLA enforcement functions require enterprise contract bindings.
+3. **Polygon IoU Topology Merging**: `scoring.py` computes Cohen's and Fleiss' Kappa on category presence and geometry counts. Full polygon union / IoU spatial geometry clipping is marked as `TODO` in `scoring.py`.
+4. **Webhook Exponential Backoff**: Webhook delivery runs in background tasks. Distributed retry queues (e.g. Celery / Redis) are marked as `TODO`.

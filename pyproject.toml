@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolabel-sdk"
+version = "1.0.0"
+description = "Official Python SDK for GeoLabel Specialist Geospatial Annotation Platform"
+readme = "README.md"
+authors = [{ name = "GeoLabel Engineering Team", email = "dev@geolabel.ai" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://geolabel.ai"
+Documentation = "https://geolabel.ai/docs"
+Repository = "https://github.com/geolabel/geolabel-python"

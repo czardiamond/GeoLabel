@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Database, Download, Eye, Layers, Filter, CheckCircle, ShieldCheck, Sparkles, FileCode2 } from 'lucide-react';
+import { Database, Download, Eye, Layers, Filter, CheckCircle, ShieldCheck, Sparkles, FileCode2, CheckSquare, Square, FileJson, Check } from 'lucide-react';
 
 interface BenchmarkDataset {
   id: string;
@@ -100,10 +100,28 @@ const DATASETS: BenchmarkDataset[] = [
 export const DatasetBenchmarkGallery: React.FC = () => {
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [selectedGeoJson, setSelectedGeoJson] = useState<BenchmarkDataset | null>(null);
+  const [selectedDatasetIds, setSelectedDatasetIds] = useState<string[]>(
+    DATASETS.map((d) => d.id)
+  );
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
 
   const filteredDatasets = selectedCategory === 'all'
     ? DATASETS
     : DATASETS.filter(d => d.category === selectedCategory);
+
+  const toggleSelectDataset = (id: string) => {
+    setSelectedDatasetIds(prev =>
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  const toggleSelectAll = () => {
+    if (selectedDatasetIds.length === DATASETS.length) {
+      setSelectedDatasetIds([]);
+    } else {
+      setSelectedDatasetIds(DATASETS.map(d => d.id));
+    }
+  };
 
   const handleDownloadSample = (dataset: BenchmarkDataset) => {
     const blob = new Blob([dataset.geoJsonSample], { type: 'application/json' });
@@ -115,6 +133,56 @@ export const DatasetBenchmarkGallery: React.FC = () => {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const handleExportBulkManifest = () => {
+    const datasetsToExport = DATASETS.filter(d => selectedDatasetIds.includes(d.id));
+    if (datasetsToExport.length === 0) {
+      alert('Please select at least one benchmark dataset to export.');
+      return;
+    }
+
+    const manifest = {
+      repository: 'GeoLabel Benchmark Dataset Catalog',
+      version: '2.1.0-manifest',
+      exportedAt: new Date().toISOString(),
+      totalSelectedDatasets: datasetsToExport.length,
+      datasets: datasetsToExport.map(ds => {
+        let parsedGeoJson = null;
+        try {
+          parsedGeoJson = JSON.parse(ds.geoJsonSample);
+        } catch (e) {
+          parsedGeoJson = ds.geoJsonSample;
+        }
+
+        return {
+          id: ds.id,
+          title: ds.title,
+          category: ds.category,
+          resolutionGsd: ds.resolutionGsd,
+          featureCount: ds.featureCount,
+          accuracyIou: ds.accuracyIou,
+          description: ds.description,
+          sampleImageryUrl: ds.imageUrl,
+          tags: ds.tags,
+          geoJsonSampleSpec: parsedGeoJson,
+        };
+      })
+    };
+
+    const manifestJson = JSON.stringify(manifest, null, 2);
+    const blob = new Blob([manifestJson], { type: 'application/json;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `geolabel_benchmark_manifest_${datasetsToExport.length}_datasets.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setExportNotice(`Exported structured JSON manifest for ${datasetsToExport.length} dataset(s)!`);
+    setTimeout(() => setExportNotice(null), 4000);
   };
 
   return (
@@ -135,83 +203,146 @@ export const DatasetBenchmarkGallery: React.FC = () => {
           </p>
         </div>
 
-        {/* Category Filters */}
-        <div className="flex justify-center gap-2 mb-10 flex-wrap">
-          <button
-            onClick={() => setSelectedCategory('all')}
-            className={`px-4 py-2 text-xs font-mono rounded-xl transition-all ${
-              selectedCategory === 'all'
-                ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
-                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-            }`}
-          >
-            All Datasets (4)
-          </button>
-          <button
-            onClick={() => setSelectedCategory('aerial')}
-            className={`px-4 py-2 text-xs font-mono rounded-xl transition-all ${
-              selectedCategory === 'aerial'
-                ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
-                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-            }`}
-          >
-            Aerial Sub-10cm GSD
-          </button>
-          <button
-            onClick={() => setSelectedCategory('satellite')}
-            className={`px-4 py-2 text-xs font-mono rounded-xl transition-all ${
-              selectedCategory === 'satellite'
-                ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
-                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-            }`}
-          >
-            Optical Satellite 30cm
-          </button>
-          <button
-            onClick={() => setSelectedCategory('sar')}
-            className={`px-4 py-2 text-xs font-mono rounded-xl transition-all ${
-              selectedCategory === 'sar'
-                ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
-                : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
-            }`}
-          >
-            SAR Radar
-          </button>
+        {/* Category Filters & Bulk Download Actions */}
+        <div className="space-y-4 mb-10">
+          <div className="flex justify-center gap-2 flex-wrap">
+            <button
+              onClick={() => setSelectedCategory('all')}
+              className={`px-4 py-2 text-xs font-mono rounded-xl transition-all cursor-pointer ${
+                selectedCategory === 'all'
+                  ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
+                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              }`}
+            >
+              All Datasets ({DATASETS.length})
+            </button>
+            <button
+              onClick={() => setSelectedCategory('aerial')}
+              className={`px-4 py-2 text-xs font-mono rounded-xl transition-all cursor-pointer ${
+                selectedCategory === 'aerial'
+                  ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
+                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              }`}
+            >
+              Aerial Sub-10cm GSD
+            </button>
+            <button
+              onClick={() => setSelectedCategory('satellite')}
+              className={`px-4 py-2 text-xs font-mono rounded-xl transition-all cursor-pointer ${
+                selectedCategory === 'satellite'
+                  ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
+                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              }`}
+            >
+              Optical Satellite 30cm
+            </button>
+            <button
+              onClick={() => setSelectedCategory('sar')}
+              className={`px-4 py-2 text-xs font-mono rounded-xl transition-all cursor-pointer ${
+                selectedCategory === 'sar'
+                  ? 'bg-teal-800 text-white font-bold border border-teal-600 shadow-md'
+                  : 'bg-slate-900 text-slate-400 hover:text-white border border-slate-800'
+              }`}
+            >
+              SAR Radar
+            </button>
+          </div>
+
+          {/* Bulk Download Manifest Bar */}
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={toggleSelectAll}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-mono transition border border-slate-700 cursor-pointer"
+              >
+                {selectedDatasetIds.length === DATASETS.length ? (
+                  <CheckSquare className="w-4 h-4 text-teal-400" />
+                ) : (
+                  <Square className="w-4 h-4 text-slate-400" />
+                )}
+                <span>
+                  {selectedDatasetIds.length === DATASETS.length ? 'Deselect All' : 'Select All'}
+                </span>
+              </button>
+              <span className="text-xs text-slate-300 font-mono">
+                <strong className="text-teal-300">{selectedDatasetIds.length}</strong> of {DATASETS.length} Datasets Selected for Bulk Export
+              </span>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {exportNotice && (
+                <span className="text-xs font-mono text-emerald-400 flex items-center gap-1 bg-emerald-950/80 px-3 py-1 rounded-lg border border-emerald-500/40">
+                  <Check className="w-3.5 h-3.5" />
+                  {exportNotice}
+                </span>
+              )}
+
+              <button
+                onClick={handleExportBulkManifest}
+                disabled={selectedDatasetIds.length === 0}
+                className="px-5 py-2.5 bg-teal-500 hover:bg-teal-400 disabled:opacity-40 text-slate-950 font-extrabold text-xs rounded-xl shadow-lg shadow-teal-500/20 transition flex items-center gap-2 cursor-pointer"
+              >
+                <FileJson className="w-4 h-4" />
+                <span>Bulk Download JSON Manifest ({selectedDatasetIds.length})</span>
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* Dataset Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {filteredDatasets.map((ds) => (
-            <div
-              key={ds.id}
-              className="bg-slate-900 border border-slate-800 hover:border-teal-700/80 rounded-2xl p-6 flex flex-col justify-between transition-all group hover:shadow-xl"
-            >
-              {/* Real Satellite Imagery Thumbnail Banner with Ground Truth Overlays */}
-              <div className="relative h-44 my-4 rounded-xl overflow-hidden border border-slate-800 bg-slate-950 group/img">
-                <img
-                  src={ds.imageUrl}
-                  alt={ds.title}
-                  className="w-full h-full object-cover opacity-80 group-hover/img:scale-105 transition-transform duration-500"
-                  referrerPolicy="no-referrer"
-                />
-                <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/30" />
-                
-                {/* Vector Ground Truth Overlay Illustration */}
-                <svg className="absolute inset-0 w-full h-full pointer-events-none">
-                  <rect x="25%" y="25%" width="45%" height="35%" fill="rgba(20, 184, 166, 0.2)" stroke="#14b8a6" strokeWidth="2" strokeDasharray="4 2" />
-                  <circle cx="25%" cy="25%" r="4" fill="#14b8a6" />
-                  <circle cx="70%" cy="25%" r="4" fill="#14b8a6" />
-                  <circle cx="70%" cy="60%" r="4" fill="#14b8a6" />
-                  <circle cx="25%" cy="60%" r="4" fill="#14b8a6" />
+          {filteredDatasets.map((ds) => {
+            const isSelected = selectedDatasetIds.includes(ds.id);
+            return (
+              <div
+                key={ds.id}
+                className={`bg-slate-900 border rounded-2xl p-6 flex flex-col justify-between transition-all group hover:shadow-xl relative ${
+                  isSelected ? 'border-teal-500/80 bg-slate-900/95' : 'border-slate-800'
+                }`}
+              >
+                {/* Selection Checkbox Pill */}
+                <button
+                  onClick={() => toggleSelectDataset(ds.id)}
+                  className={`absolute top-4 right-4 z-10 px-2.5 py-1 rounded-lg text-xs font-mono flex items-center gap-1.5 transition cursor-pointer border ${
+                    isSelected
+                      ? 'bg-teal-500 text-slate-950 border-teal-300 font-bold'
+                      : 'bg-slate-950/80 text-slate-400 border-slate-700 hover:text-white'
+                  }`}
+                >
+                  {isSelected ? (
+                    <CheckSquare className="w-3.5 h-3.5" />
+                  ) : (
+                    <Square className="w-3.5 h-3.5" />
+                  )}
+                  <span>{isSelected ? 'Manifest Selected' : 'Select'}</span>
+                </button>
 
-                  <rect x="55%" y="45%" width="35%" height="40%" fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" strokeWidth="2" />
-                </svg>
+                {/* Real Satellite Imagery Thumbnail Banner with Ground Truth Overlays */}
+                <div className="relative h-44 my-4 rounded-xl overflow-hidden border border-slate-800 bg-slate-950 group/img">
+                  <img
+                    src={ds.imageUrl}
+                    alt={ds.title}
+                    className="w-full h-full object-cover opacity-80 group-hover/img:scale-105 transition-transform duration-500"
+                    referrerPolicy="no-referrer"
+                  />
+                  <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-slate-950/30" />
+                  
+                  {/* Vector Ground Truth Overlay Illustration */}
+                  <svg className="absolute inset-0 w-full h-full pointer-events-none">
+                    <rect x="25%" y="25%" width="45%" height="35%" fill="rgba(20, 184, 166, 0.2)" stroke="#14b8a6" strokeWidth="2" strokeDasharray="4 2" />
+                    <circle cx="25%" cy="25%" r="4" fill="#14b8a6" />
+                    <circle cx="70%" cy="25%" r="4" fill="#14b8a6" />
+                    <circle cx="70%" cy="60%" r="4" fill="#14b8a6" />
+                    <circle cx="25%" cy="60%" r="4" fill="#14b8a6" />
 
-                <div className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded bg-slate-950/90 border border-teal-500 text-[10px] font-mono text-teal-300 flex items-center gap-1 shadow-md">
-                  <ShieldCheck className="w-3 h-3 text-teal-400" />
-                  <span>Verified Ground Truth Vector</span>
+                    <rect x="55%" y="45%" width="35%" height="40%" fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" strokeWidth="2" />
+                  </svg>
+
+                  <div className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded bg-slate-950/90 border border-teal-500 text-[10px] font-mono text-teal-300 flex items-center gap-1 shadow-md">
+                    <ShieldCheck className="w-3 h-3 text-teal-400" />
+                    <span>Verified Ground Truth Vector</span>
+                  </div>
                 </div>
-              </div>
 
               <div>
                 <div className="flex items-center justify-between mb-2">
@@ -265,7 +396,8 @@ export const DatasetBenchmarkGallery: React.FC = () => {
                 </div>
               </div>
             </div>
-          ))}
+          );
+        })}
         </div>
 
         {/* Modal for viewing GeoJSON sample */}

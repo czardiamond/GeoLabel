@@ -7,6 +7,11 @@ import {
   ScoringResult,
   TaskType
 } from '../utils/scoringEngine';
+import { SamSegmentTool, SamPromptPoint } from './SamSegmentTool';
+import { GisLayerUploaderModal } from './GisLayerUploaderModal';
+import { ConsensusQACenterModal } from './ConsensusQACenterModal';
+import { OntologySchemaBuilderModal, CustomOntologyClass } from './OntologySchemaBuilderModal';
+import { CloudSyncAndFineTuneModal } from './CloudSyncAndFineTuneModal';
 import {
   Code2,
   Copy,
@@ -66,7 +71,13 @@ import {
   PieChart,
   Activity,
   TrendingUp,
-  Bot
+  Bot,
+  Database,
+  CloudUpload,
+  GitCompare,
+  BookOpen,
+  Crosshair,
+  Split
 } from 'lucide-react';
 
 interface DrawnPolygon {
@@ -378,6 +389,65 @@ export const InteractiveAnnotationStudio: React.FC = () => {
   const [newTileName, setNewTileName] = useState<string>('');
   const [newTileLocation, setNewTileLocation] = useState<string>('');
   const [isAddTileFormOpen, setIsAddTileFormOpen] = useState<boolean>(false);
+
+  // 1. Custom GIS Layers & Custom Imagery Upload Modal State
+  const [isGisUploaderOpen, setIsGisUploaderOpen] = useState<boolean>(false);
+  const [activeTileSource, setActiveTileSource] = useState<string>('esri_world');
+  const [customXyzUrl, setCustomXyzUrl] = useState<string>('');
+  const [customImageUrl, setCustomImageUrl] = useState<string | null>(null);
+  const [isMultiTemporalActive, setIsMultiTemporalActive] = useState<boolean>(false);
+  const [multiTemporalSliderPos, setMultiTemporalSliderPos] = useState<number>(50);
+  const [beforeDateImage, setBeforeDateImage] = useState<string>(SAMPLE_ANNOTATION_DEMOS[0].imageUrl);
+  const [afterDateImage, setAfterDateImage] = useState<string>('https://images.unsplash.com/photo-1578575437130-527eed3abbec?auto=format&fit=crop&w=1600&q=80');
+
+  // 2. Interactive SAM 2 Click-to-Segment Tool State
+  const [isSamModalOpen, setIsSamModalOpen] = useState<boolean>(false);
+  const [isSamModeActive, setIsSamModeActive] = useState<boolean>(false);
+  const [promptPoints, setPromptPoints] = useState<SamPromptPoint[]>([]);
+  const [activePromptMode, setActivePromptMode] = useState<'positive' | 'negative'>('positive');
+
+  // 3. Multi-Annotator Consensus & Quality Control QA/QC State
+  const [isQACenterOpen, setIsQACenterOpen] = useState<boolean>(false);
+  const [showIouHeatmap, setShowIouHeatmap] = useState<boolean>(false);
+  const [showErrorHeatmap, setShowErrorHeatmap] = useState<boolean>(false);
+  const [activeAnnotatorView, setActiveAnnotatorView] = useState<'senior' | 'annotator_a' | 'annotator_b' | 'consensus'>('consensus');
+
+  // 4. Domain-Specific Class Ontology & Schema Builder State
+  const [isOntologyModalOpen, setIsOntologyModalOpen] = useState<boolean>(false);
+  const [customClasses, setCustomClasses] = useState<CustomOntologyClass[]>([
+    {
+      id: 'building_footprint',
+      className: 'building_footprint',
+      colorHex: '#14b8a6',
+      shortcutKey: 'B',
+      attributes: [
+        { name: 'material', type: 'select', options: ['Concrete', 'Metal', 'Shingle'], required: true },
+        { name: 'floors', type: 'number', required: false },
+      ],
+    },
+    {
+      id: 'solar_pv_array',
+      className: 'solar_pv_array',
+      colorHex: '#f59e0b',
+      shortcutKey: 'S',
+      attributes: [
+        { name: 'condition', type: 'select', options: ['Intact', 'Damaged', 'Soiled'], required: true },
+        { name: 'capacity_kw', type: 'number', required: false },
+      ],
+    },
+    {
+      id: 'cargo_vessel',
+      className: 'cargo_vessel',
+      colorHex: '#3b82f6',
+      shortcutKey: 'C',
+      attributes: [
+        { name: 'vessel_type', type: 'select', options: ['Container Ship', 'Bulk Carrier', 'Tanker'], required: true },
+      ],
+    },
+  ]);
+
+  // 5. Direct Cloud Pipeline & Model Training Export State
+  const [isCloudSyncModalOpen, setIsCloudSyncModalOpen] = useState<boolean>(false);
 
   // Undo/Redo Stack State
   const [history, setHistory] = useState<
@@ -1628,6 +1698,64 @@ export const InteractiveAnnotationStudio: React.FC = () => {
               <span>Task 3: Grid Cell Classification</span>
             </button>
           </div>
+        </div>
+
+        {/* ENTERPRISE GEOSPATIAL FEATURE TOOLBAR */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 font-mono text-xs">
+          <button
+            onClick={() => setIsSamModalOpen(true)}
+            className="p-3 bg-gradient-to-r from-purple-950/80 to-slate-900 hover:from-purple-900/90 border border-purple-700/80 rounded-xl text-purple-200 font-bold transition-all flex items-center gap-2 shadow-lg hover:scale-[1.02] cursor-pointer"
+          >
+            <Crosshair className="w-4 h-4 text-purple-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="text-[11px] text-white">SAM 2 Vectoring</div>
+              <div className="text-[9px] text-purple-300 font-normal truncate">Point-and-Click Segment</div>
+            </div>
+          </button>
+
+          <button
+            onClick={() => setIsGisUploaderOpen(true)}
+            className="p-3 bg-gradient-to-r from-teal-950/80 to-slate-900 hover:from-teal-900/90 border border-teal-700/80 rounded-xl text-teal-200 font-bold transition-all flex items-center gap-2 shadow-lg hover:scale-[1.02] cursor-pointer"
+          >
+            <Layers className="w-4 h-4 text-teal-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="text-[11px] text-white">GIS Layers & Imagery</div>
+              <div className="text-[9px] text-teal-300 font-normal truncate">GeoTIFF / WMS / XYZ</div>
+            </div>
+          </button>
+
+          <button
+            onClick={() => setIsQACenterOpen(true)}
+            className="p-3 bg-gradient-to-r from-amber-950/80 to-slate-900 hover:from-amber-900/90 border border-amber-700/80 rounded-xl text-amber-200 font-bold transition-all flex items-center gap-2 shadow-lg hover:scale-[1.02] cursor-pointer"
+          >
+            <Users className="w-4 h-4 text-amber-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="text-[11px] text-white">QA/QC Consensus</div>
+              <div className="text-[9px] text-amber-300 font-normal truncate">Multi-Annotator IoU</div>
+            </div>
+          </button>
+
+          <button
+            onClick={() => setIsOntologyModalOpen(true)}
+            className="p-3 bg-gradient-to-r from-indigo-950/80 to-slate-900 hover:from-indigo-900/90 border border-indigo-700/80 rounded-xl text-indigo-200 font-bold transition-all flex items-center gap-2 shadow-lg hover:scale-[1.02] cursor-pointer"
+          >
+            <BookOpen className="w-4 h-4 text-indigo-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="text-[11px] text-white">Taxonomy Schema</div>
+              <div className="text-[9px] text-indigo-300 font-normal truncate">Custom Class Ontologies</div>
+            </div>
+          </button>
+
+          <button
+            onClick={() => setIsCloudSyncModalOpen(true)}
+            className="p-3 bg-gradient-to-r from-emerald-950/80 to-slate-900 hover:from-emerald-900/90 border border-emerald-700/80 rounded-xl text-emerald-200 font-bold transition-all flex items-center gap-2 shadow-lg hover:scale-[1.02] cursor-pointer col-span-2 sm:col-span-1"
+          >
+            <CloudUpload className="w-4 h-4 text-emerald-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="text-[11px] text-white">Cloud Sync & Fine-Tune</div>
+              <div className="text-[9px] text-emerald-300 font-normal truncate">GCS/S3 Export & Training</div>
+            </div>
+          </button>
         </div>
 
         {/* AUTO-SAVE RESTORATION & STATUS TOAST */}
@@ -3687,6 +3815,83 @@ export const InteractiveAnnotationStudio: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 1. CUSTOM GIS LAYERS & CUSTOM IMAGERY UPLOADER MODAL */}
+      <GisLayerUploaderModal
+        isOpen={isGisUploaderOpen}
+        onClose={() => setIsGisUploaderOpen(false)}
+        activeTileSource={activeTileSource}
+        setActiveTileSource={setActiveTileSource}
+        customXyzUrl={customXyzUrl}
+        setCustomXyzUrl={setCustomXyzUrl}
+        customImageUrl={customImageUrl}
+        setCustomImageUrl={setCustomImageUrl}
+        isMultiTemporalActive={isMultiTemporalActive}
+        setIsMultiTemporalActive={setIsMultiTemporalActive}
+        multiTemporalSliderPos={multiTemporalSliderPos}
+        setMultiTemporalSliderPos={setMultiTemporalSliderPos}
+        beforeDateImage={beforeDateImage}
+        setBeforeDateImage={setBeforeDateImage}
+        afterDateImage={afterDateImage}
+        setAfterDateImage={setAfterDateImage}
+      />
+
+      {/* 2. SAM 2 INTERACTIVE CLICK-TO-SEGMENT MODAL */}
+      <SamSegmentTool
+        isOpen={isSamModalOpen}
+        onClose={() => setIsSamModalOpen(false)}
+        imageUrl={currentDemo.imageUrl}
+        promptPoints={promptPoints}
+        setPromptPoints={setPromptPoints}
+        activePromptMode={activePromptMode}
+        setActivePromptMode={setActivePromptMode}
+        onAcceptPolygon={(newPolyPoints) => {
+          const newPoly: DrawnPolygon = {
+            id: `poly-sam-${Date.now()}`,
+            label: activeClass,
+            color: activeClass === 'solar_pv_array' ? '#f59e0b' : activeClass === 'cargo_vessel' ? '#3b82f6' : '#14b8a6',
+            toolType: 'polygon',
+            points: newPolyPoints,
+            visible: true,
+            confidence: 0.99,
+            notes: 'Extracted via SAM 2 Point-and-Click Vectorizer',
+          };
+          setPolygons((prev) => [...prev, newPoly]);
+          setIsSamModalOpen(false);
+          setPromptPoints([]);
+        }}
+      />
+
+      {/* 3. MULTI-ANNOTATOR CONSENSUS & QA/QC CENTER MODAL */}
+      <ConsensusQACenterModal
+        isOpen={isQACenterOpen}
+        onClose={() => setIsQACenterOpen(false)}
+        currentPolygons={polygons}
+        showIouHeatmap={showIouHeatmap}
+        setShowIouHeatmap={setShowIouHeatmap}
+        showErrorHeatmap={showErrorHeatmap}
+        setShowErrorHeatmap={setShowErrorHeatmap}
+        activeAnnotatorView={activeAnnotatorView}
+        setActiveAnnotatorView={setActiveAnnotatorView}
+      />
+
+      {/* 4. DOMAIN-SPECIFIC CLASS ONTOLOGY & SCHEMA BUILDER MODAL */}
+      <OntologySchemaBuilderModal
+        isOpen={isOntologyModalOpen}
+        onClose={() => setIsOntologyModalOpen(false)}
+        customClasses={customClasses}
+        setCustomClasses={setCustomClasses}
+        activeClass={activeClass}
+        setActiveClass={setActiveClass}
+      />
+
+      {/* 5. DIRECT CLOUD PIPELINE & MODEL TRAINING EXPORT MODAL */}
+      <CloudSyncAndFineTuneModal
+        isOpen={isCloudSyncModalOpen}
+        onClose={() => setIsCloudSyncModalOpen(false)}
+        polygonCount={polygons.length}
+        tileName={currentDemo.name}
+      />
     </section>
   );
 };

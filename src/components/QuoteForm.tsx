@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { GEO_SERVICES } from '../data/geospatialData';
 import { QuoteFormData, QuoteSubmissionResult } from '../types';
 import {
@@ -16,7 +16,9 @@ import {
   Compass,
   Download,
   Sparkles,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Save,
+  Check
 } from 'lucide-react';
 
 import { saveQuoteRecord } from '../utils/storage';
@@ -24,6 +26,8 @@ import { saveQuoteRecord } from '../utils/storage';
 interface QuoteFormProps {
   preselectedCategoryId?: string | null;
 }
+
+const DRAFT_STORAGE_KEY = 'geolabel_quote_form_draft_v1';
 
 export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) => {
   const [formData, setFormData] = useState<QuoteFormData>({
@@ -48,6 +52,40 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [submissionResult, setSubmissionResult] = useState<QuoteSubmissionResult | null>(null);
   const [dragActive, setDragActive] = useState<boolean>(false);
+  const [draftSavedToast, setDraftSavedToast] = useState<boolean>(false);
+  const [emailNotificationToast, setEmailNotificationToast] = useState<string | null>(null);
+
+  // Restore draft from localStorage on mount
+  useEffect(() => {
+    try {
+      const savedDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
+      if (savedDraft) {
+        const parsed = JSON.parse(savedDraft);
+        if (parsed && typeof parsed === 'object') {
+          setFormData(prev => ({
+            ...prev,
+            ...parsed,
+            projectType: preselectedCategoryId || parsed.projectType || 'ai-ml-training',
+          }));
+          setDraftSavedToast(true);
+          setTimeout(() => setDraftSavedToast(false), 4000);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to restore quote draft from localStorage:', e);
+    }
+  }, [preselectedCategoryId]);
+
+  // Auto-save form inputs to localStorage as user types
+  useEffect(() => {
+    if (!submissionResult) {
+      try {
+        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(formData));
+      } catch (e) {
+        console.warn('Failed to save quote draft to localStorage:', e);
+      }
+    }
+  }, [formData, submissionResult]);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const { name, value, type } = e.target;
@@ -134,6 +172,7 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
       };
 
       console.log('Intake Form Submitted Successfully:', result);
+      console.log(`[MOCK EMAIL NOTIFICATION SERVICE] Confirmation dispatch sent to: ${formData.email} for Quote ID: ${randomId}`);
       
       saveQuoteRecord({
         fullName: formData.fullName,
@@ -144,6 +183,14 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
         targetAccuracy: formData.targetAccuracy,
       });
 
+      // Clear auto-saved draft upon successful submission
+      try {
+        localStorage.removeItem(DRAFT_STORAGE_KEY);
+      } catch (e) {
+        console.warn('Failed to clear draft from localStorage:', e);
+      }
+
+      setEmailNotificationToast(`Mock Email Dispatched: Confirmation email sent to ${formData.email}!`);
       setSubmissionResult(result);
       setIsSubmitting(false);
     }, 1200);
@@ -151,6 +198,7 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
 
   const handleResetForm = () => {
     setSubmissionResult(null);
+    setEmailNotificationToast(null);
     setFormData(prev => ({
       ...prev,
       requirementsDescription: '',
@@ -163,6 +211,37 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
     <section id="quote-section" className="py-20 bg-slate-900 border-b border-slate-800/80 relative">
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 space-y-10">
         
+        {/* Toast Alerts */}
+        {emailNotificationToast && (
+          <div className="bg-emerald-950 border border-emerald-500 text-emerald-300 px-4 py-3 rounded-xl flex items-center justify-between text-xs font-mono shadow-lg animate-in fade-in slide-in-from-top-2">
+            <div className="flex items-center gap-2">
+              <Mail className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{emailNotificationToast}</span>
+            </div>
+            <button
+              onClick={() => setEmailNotificationToast(null)}
+              className="text-emerald-400 hover:text-white ml-4 font-bold"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
+        {draftSavedToast && !submissionResult && (
+          <div className="bg-teal-950/90 border border-teal-600 text-teal-300 px-3.5 py-2 rounded-xl flex items-center justify-between text-xs font-mono shadow-md animate-in fade-in">
+            <div className="flex items-center gap-2">
+              <Save className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+              <span>Restored auto-saved quote request draft from your last session.</span>
+            </div>
+            <button
+              onClick={() => setDraftSavedToast(false)}
+              className="text-teal-400 hover:text-white font-bold text-sm"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {/* Section Header */}
         <div className="text-center space-y-4">
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-950/80 border border-teal-800/80 text-teal-300 text-xs font-mono">
@@ -266,6 +345,16 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
             onSubmit={handleSubmit}
             className="bg-slate-950 border border-slate-800 rounded-2xl p-6 sm:p-10 space-y-8 shadow-2xl"
           >
+            {/* Auto-Save Status Bar */}
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-slate-900/90 px-4 py-2.5 rounded-xl border border-slate-800 text-xs font-mono gap-2">
+              <div className="flex items-center gap-2 text-teal-300 font-semibold">
+                <Save className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                <span>Auto-Save Enabled (localStorage)</span>
+              </div>
+              <span className="text-[11px] text-slate-400">
+                Your draft progress is continuously saved to your browser so you won't lose work.
+              </span>
+            </div>
             
             {/* Form Section 1: Contact & Organization */}
             <div className="space-y-4">

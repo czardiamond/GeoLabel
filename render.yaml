@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: geolabel-backend-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GEOLABEL_API_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:///./geolabel.db
