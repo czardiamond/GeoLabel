@@ -160,8 +160,7 @@ def create_task(
 @app.get("/tasks/{task_id}", response_model=TaskResponse)
 def get_task_status(
     task_id: str,
-    db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
+    db: Session = Depends(get_db)
 ):
     """
     Check status, metadata, and progress of an annotation task.

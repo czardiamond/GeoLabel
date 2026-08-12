@@ -271,6 +271,19 @@ export const InteractiveAnnotationStudio: React.FC = () => {
   const [isDraggingBBox, setIsDraggingBBox] = useState<boolean>(false);
   const [selectedPolyId, setSelectedPolyId] = useState<string | null>('poly-1');
 
+  // Real Backend REST API Integration State
+  const [annotatorApiKey, setAnnotatorApiKey] = useState<string>('');
+  const [taskIdInput, setTaskIdInput] = useState<string>('');
+  const [isRegisteringKey, setIsRegisteringKey] = useState<boolean>(false);
+  const [isFetchingTask, setIsFetchingTask] = useState<boolean>(false);
+  const [isSubmittingAnnotation, setIsSubmittingAnnotation] = useState<boolean>(false);
+  const [loadedTask, setLoadedTask] = useState<any | null>(null);
+  const [apiResponseStatus, setApiResponseStatus] = useState<{
+    success: boolean;
+    message: string;
+    details?: any;
+  } | null>(null);
+
   // Live Scoring Engine Result State
   const [scoringResult, setScoringResult] = useState<ScoringResult | null>(null);
   const [isScoringRunning, setIsScoringRunning] = useState<boolean>(false);
@@ -1438,6 +1451,112 @@ export const InteractiveAnnotationStudio: React.FC = () => {
     }
   };
 
+  // Railway Backend Deployment Base URL
+  const API_BASE_URL = 'https://web-production-149bd.up.railway.app';
+
+  const handleFetchTask = async () => {
+    const targetId = taskIdInput.trim();
+    if (!targetId) {
+      setApiResponseStatus({
+        success: false,
+        message: 'Please enter a Task ID to load from the backend.',
+      });
+      return;
+    }
+
+    setIsFetchingTask(true);
+    setApiResponseStatus(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(targetId)}`);
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null);
+        const errDetail = errJson?.detail || (await res.text().catch(() => 'Task not found'));
+        throw new Error(`HTTP ${res.status}: ${errDetail}`);
+      }
+      const taskData = await res.json();
+      setLoadedTask(taskData);
+      if (taskData.crs) {
+        setCrsMetadata(taskData.crs);
+      }
+      setApiResponseStatus({
+        success: true,
+        message: `Task "${taskData.id}" loaded successfully! Status: ${taskData.status.toUpperCase()} | CRS: ${taskData.crs} | Target Annotators: ${taskData.target_annotator_count}`,
+        details: taskData,
+      });
+    } catch (err: any) {
+      setLoadedTask(null);
+      setApiResponseStatus({
+        success: false,
+        message: `Failed to fetch task "${targetId}": ${err.message}`,
+      });
+    } finally {
+      setIsFetchingTask(false);
+    }
+  };
+
+  const handleSubmitAnnotationToBackend = async () => {
+    const targetId = (loadedTask?.id || taskIdInput).trim();
+    if (!targetId) {
+      setApiResponseStatus({
+        success: false,
+        message: 'Please enter or load a Task ID before submitting annotations.',
+      });
+      return;
+    }
+
+    if (!annotatorApiKey.trim()) {
+      setApiResponseStatus({
+        success: false,
+        message: 'Missing Annotator API Key. Please paste your key into the header input field.',
+      });
+      return;
+    }
+
+    setIsSubmittingAnnotation(true);
+    setApiResponseStatus(null);
+
+    try {
+      const geoJsonString = generateDynamicGeoJson();
+      const geoJsonData = JSON.parse(geoJsonString);
+
+      const res = await fetch(`${API_BASE_URL}/tasks/${encodeURIComponent(targetId)}/annotations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Annotator-API-Key': annotatorApiKey.trim(),
+        },
+        body: JSON.stringify({
+          geojson: geoJsonData,
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null);
+        const errDetail = errJson?.detail || (await res.text().catch(() => 'Submission error'));
+        throw new Error(`HTTP ${res.status}: ${errDetail}`);
+      }
+
+      const updatedTask = await res.json();
+      setLoadedTask(updatedTask);
+      setApiResponseStatus({
+        success: true,
+        message: `Annotation submitted successfully for Task "${updatedTask.id}"! Status: ${updatedTask.status.toUpperCase()}${
+          updatedTask.iaa_score !== null && updatedTask.iaa_score !== undefined
+            ? ` | IAA Score: ${(updatedTask.iaa_score * 100).toFixed(1)}% (${updatedTask.iaa_type || 'Consensus'})`
+            : ''
+        }`,
+        details: updatedTask,
+      });
+    } catch (err: any) {
+      setApiResponseStatus({
+        success: false,
+        message: `Annotation submission failed: ${err.message}`,
+      });
+    } finally {
+      setIsSubmittingAnnotation(false);
+    }
+  };
+
   // Generate MS COCO Format JSON
   const generateCOCOJson = () => {
     const categories = [
@@ -1775,6 +1894,129 @@ export const InteractiveAnnotationStudio: React.FC = () => {
             )}
           </div>
         )}
+
+        {/* REAL BACKEND REST API CONNECTION BAR */}
+        <div className="bg-slate-950 p-4 sm:p-5 rounded-2xl border border-teal-800/80 shadow-2xl space-y-4 font-mono text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-teal-400" />
+              <span className="font-bold text-white text-xs uppercase tracking-wider">
+                GeoLabel Backend REST API Sync Layer
+              </span>
+              <span className="bg-teal-950 text-teal-300 border border-teal-800 px-2 py-0.5 rounded text-[10px] font-bold flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                API Connected
+              </span>
+            </div>
+
+            {loadedTask && (
+              <div className="flex items-center gap-2 text-[11px] text-slate-300 bg-slate-900 px-3 py-1 rounded-lg border border-slate-800">
+                <span className="text-slate-500">Loaded Task ID:</span>
+                <span className="font-bold text-teal-300">{loadedTask.id}</span>
+                <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 border border-slate-700 uppercase">
+                  {loadedTask.status}
+                </span>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-12 gap-3 items-end">
+            {/* Input 1: Annotator API Key */}
+            <div className="lg:col-span-5 space-y-1.5">
+              <label className="text-[11px] text-slate-300 font-bold flex items-center justify-between">
+                <span>Annotator API Key (`X-Annotator-API-Key`)</span>
+                <span className="text-slate-400 font-normal text-[10px]">
+                  Don't have a key? Contact project admin to get one.
+                </span>
+              </label>
+              <div className="relative">
+                <input
+                  type="text"
+                  value={annotatorApiKey}
+                  onChange={(e) => setAnnotatorApiKey(e.target.value)}
+                  placeholder="Paste gl_ann_... API key provided by admin"
+                  className="w-full bg-slate-900 border border-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:border-teal-500"
+                />
+              </div>
+            </div>
+
+            {/* Input 2: Task ID */}
+            <div className="lg:col-span-4 space-y-1.5">
+              <label className="text-[11px] text-slate-300 font-bold flex items-center justify-between">
+                <span>Task ID (`GET /tasks/task_id`)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={taskIdInput}
+                  onChange={(e) => setTaskIdInput(e.target.value)}
+                  placeholder="Enter task ID (e.g. task_abc123)"
+                  className="w-full bg-slate-900 border border-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:border-teal-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleFetchTask}
+                  disabled={isFetchingTask || !taskIdInput.trim()}
+                  className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-teal-300 font-bold rounded-xl border border-teal-600/80 transition-all cursor-pointer disabled:opacity-50 shrink-0 flex items-center gap-1.5"
+                >
+                  {isFetchingTask ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5" />
+                  )}
+                  <span>Load Task</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Submit Button */}
+            <div className="lg:col-span-3">
+              <button
+                type="button"
+                onClick={handleSubmitAnnotationToBackend}
+                disabled={isSubmittingAnnotation}
+                className="w-full py-2.5 px-4 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white font-bold rounded-xl border border-teal-400 shadow-lg shadow-teal-900/30 transition-all cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {isSubmittingAnnotation ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                    <span>Submitting GeoJSON...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-4 h-4 text-teal-200" />
+                    <span>Submit Annotation</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Response Notification Banner */}
+          {apiResponseStatus && (
+            <div
+              className={`p-3 rounded-xl border font-mono text-xs flex items-start gap-3.5 animate-fade-in ${
+                apiResponseStatus.success
+                  ? 'bg-emerald-950/90 border-emerald-600/80 text-emerald-200'
+                  : 'bg-rose-950/90 border-rose-600/80 text-rose-200'
+              }`}
+            >
+              {apiResponseStatus.success ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
+              ) : (
+                <XCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+              )}
+              <div className="space-y-1 overflow-x-auto w-full">
+                <div className="font-bold">{apiResponseStatus.message}</div>
+                {apiResponseStatus.details && (
+                  <pre className="text-[10px] bg-slate-950/80 p-2 rounded border border-slate-800 text-slate-300 max-h-32 overflow-y-auto">
+                    {JSON.stringify(apiResponseStatus.details, null, 2)}
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* BATCH PROCESSING TILE QUEUE BAR */}
         <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 shadow-xl space-y-3 font-mono text-xs">
