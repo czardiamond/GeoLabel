@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     API_KEY: Optional[str] = Field(default=None, validation_alias="GEOLABEL_API_KEY")
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
     WEBHOOK_ALLOWED_HOSTS: str = ""
+    IMAGERY_ALLOWED_HOSTS: str = ""
+    ASSET_STORAGE_DIR: str = "./geolabel-assets"
+    MAX_ASSET_UPLOAD_MB: int = 512
+    USER_SESSION_HOURS: int = 12
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     ENVIRONMENT: str = "development"
@@ -26,6 +30,10 @@ class Settings(BaseSettings):
     @cached_property
     def webhook_allowed_host_list(self) -> set[str]:
         return {host.strip().lower().rstrip(".") for host in self.WEBHOOK_ALLOWED_HOSTS.split(",") if host.strip()}
+
+    @cached_property
+    def imagery_allowed_host_list(self) -> set[str]:
+        return {host.strip().lower().rstrip(".") for host in self.IMAGERY_ALLOWED_HOSTS.split(",") if host.strip()}
 
 
 settings = Settings()

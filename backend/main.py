@@ -31,6 +31,8 @@ from backend.schemas import (
     WebhookRegister,
 )
 from backend.scoring import build_consensus_geojson, compute_task_iaa
+from backend.identity import router as identity_router
+from backend.workflows import router as workflows_router
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +45,14 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Annotator-API-Key"],
 )
 
 security = HTTPBearer(auto_error=False)
+
+app.include_router(identity_router)
+app.include_router(workflows_router)
 
 
 def webhook_host_allowed(webhook_url: str) -> bool:

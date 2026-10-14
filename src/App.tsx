@@ -5,26 +5,27 @@ import { InteractiveAnnotationStudio } from './components/InteractiveAnnotationS
 import { ApiPipelineExplorer } from './components/ApiPipelineExplorer';
 import { QuoteForm } from './components/QuoteForm';
 import { Footer } from './components/Footer';
+import OrganizationWorkspace from './components/OrganizationWorkspace';
 
 const currentCapabilities = [
   { icon: Database, title: 'Persist task and scoping records', text: 'Task metadata and scoping requests are stored through the configured database.' },
-  { icon: KeyRound, title: 'Task-scoped annotator keys', text: 'Owners can issue one-time credentials assigned to a single task; workers can read and submit only to that task.' },
+  { icon: KeyRound, title: 'Organizations, invitations, and roles', text: 'Local accounts use expiring sessions and organization-scoped owner, admin, annotator, reviewer, and analyst roles.' },
   { icon: Layers3, title: 'Submit and reproject GeoJSON', text: 'The API accepts GeoJSON FeatureCollections and transforms submitted geometries into the task CRS.' },
-  { icon: Workflow, title: 'Agreement and consensus output', text: 'When the target annotation count is reached, the backend computes its current agreement score and returns majority-supported GeoJSON.' },
+  { icon: Workflow, title: 'Projects, datasets, annotation and review', text: 'Private raster uploads, interactive vector drawing, priority queues, reservations, comments, review/rework, and temporal video segments are supported.' },
+  { icon: Workflow, title: 'Gold-set quality and reviewable suggestions', text: 'Reviewers can maintain reference GeoJSON and calculate heuristic worker scores; provider-supplied pre-annotations can be reviewed.' },
 ];
 
 const notYetAvailable = [
-  'Raster upload, storage, tile service, or in-browser imagery rendering',
-  'Interactive drawing tools, automatic labeling, or AI-assisted annotation',
-  'Organization accounts, user roles, billing, and customer-facing task queues',
-  'Email notifications or priced quotes from the scoping form',
-  'Independently validated scoring thresholds, compliance attestations, or service-level guarantees',
+  'SSO, LDAP, MFA, password recovery, and automatic invitation email',
+  'Credentialed S3/GCS object-storage adapters and deployment-shared asset storage',
+  'AI detection, tracking, segmentation, and inference-provider credentials',
+  'Independently validated quality thresholds, compliance attestations, or service-level guarantees',
 ];
 
 export default function App() {
   const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
   const scrollToQuote = () => scrollTo('quote-section');
-  const scrollToAnnotator = () => scrollTo('interactive-studio');
+  const scrollToAnnotator = () => scrollTo('organization-workspace');
 
   return (
     <div className="min-h-screen bg-slate-950 font-sans text-slate-100 selection:bg-teal-500 selection:text-white">
@@ -38,8 +39,8 @@ export default function App() {
               <MapPinned className="mt-1 h-5 w-5 shrink-0 text-teal-300" />
               <div>
                 <p className="text-sm font-semibold uppercase tracking-[0.18em] text-teal-300">Current implementation</p>
-                <h2 className="mt-2 text-2xl font-bold text-white">A working GeoJSON-first API foundation, not a finished annotation service.</h2>
-                <p className="mt-3 max-w-3xl text-sm leading-relaxed text-slate-300">The controls below call the backend you configure. They report live server responses; an empty state or connection error is not replaced with a fabricated success.</p>
+                <h2 className="mt-2 text-2xl font-bold text-white">A working, organization-scoped annotation workflow with geospatial data controls.</h2>
+                <p className="mt-3 max-w-3xl text-sm leading-relaxed text-slate-300">The workspace calls the configured API and displays actual responses. It does not invent model predictions, scores, or successful submissions.</p>
               </div>
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
@@ -55,13 +56,18 @@ export default function App() {
               <ul className="mt-3 grid gap-2 text-sm text-amber-100/75 sm:grid-cols-2">
                 {notYetAvailable.map((item) => <li key={item}>• {item}</li>)}
               </ul>
-              <p className="mt-4 text-xs leading-relaxed text-slate-400">Agreement and consensus are implemented as an initial, heuristic spatial-matching approach. They are not an independently validated quality guarantee. Review the code and test against your domain data before using the scores for operational decisions.</p>
+              <p className="mt-4 text-xs leading-relaxed text-slate-400">Agreement, consensus, and gold-set metrics use heuristic spatial matching and are not independently validated quality guarantees. Uploaded files are stored on the configured local volume; configure durable, private storage before multi-instance or production use.</p>
             </div>
           </div>
         </section>
 
-        <ApiPipelineExplorer />
-        <InteractiveAnnotationStudio />
+        <div id="organization-workspace"><OrganizationWorkspace /></div>
+        <details className="mx-auto my-12 max-w-6xl rounded-xl border border-slate-800 bg-slate-900/50 p-5 text-slate-200">
+          <summary className="cursor-pointer font-semibold">Legacy task-key API tools</summary>
+          <p className="my-4 text-sm text-slate-400">These compatibility tools use the deployment-wide service key or an existing task-bound annotator key. Prefer the organization workspace for new projects.</p>
+          <ApiPipelineExplorer />
+          <InteractiveAnnotationStudio />
+        </details>
         <QuoteForm />
       </main>
       <Footer />
