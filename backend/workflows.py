@@ -40,6 +40,12 @@ from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
 from backend.geo_utils import reproject_feature_collection
+from backend.inference import (
+    MAX_IMAGE_BYTES,
+    get_inference_status,
+    require_inference_authorization,
+    request_provider_suggestions,
+)
 from backend.identity import MemberContext, audit, membership_for, notify, require_member, require_roles
 from backend.models import (
     Annotation,
@@ -197,6 +203,11 @@ class PreAnnotationInput(BaseModel):
 
 class PreAnnotationDecision(BaseModel):
     decision: str = Field(pattern="^(accept|reject)$")
+
+
+class InferenceSuggestionRequest(BaseModel):
+    confirm_data_transfer: bool = False
+    confirm_provider_costs: bool = False
 
 
 class AnnotationDraftSave(BaseModel):
@@ -1762,16 +1773,75 @@ def task_inference_status(task_id: str, member: MemberContext = Depends(require_
         _require_task_assignment(task, membership, member, db)
     else:
         require_roles(membership, "owner", "admin", "reviewer", "analyst")
-    return {
-        "available": False,
-        "provider_configured": False,
-        "model_configured": False,
-        "external_data_transfer": False,
-        "human_review_required": True,
-        "reason_code": "provider_and_approval_not_configured",
-        "message": (
-            "AI suggestions are unavailable: GeoLabel has no approved inference provider or model configured. "
-            "No asset imagery is sent to an external service. Provider, data-transfer, and spend approval are "
-            "required before provider-backed suggestions can be enabled; any suggestions must remain reviewable."
-        ),
-    }
+    return get_inference_status()
+
+
+@router.post("/work/tasks/{task_id}/inference/suggestions", status_code=status.HTTP_201_CREATED)
+def generate_task_suggestions(task_id: str, payload: InferenceSuggestionRequest,
+                              member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+    else:
+        require_roles(membership, "owner", "admin", "reviewer")
+    if task.task_type == "video":
+        raise HTTPException(status_code=415, detail="Automatic video inference is not implemented; this route accepts georeferenced image previews only.")
+    try:
+        provider = require_inference_authorization(
+            confirm_data_transfer=payload.confirm_data_transfer,
+            confirm_provider_costs=payload.confirm_provider_costs,
+        )
+    except PermissionError as exc:
+        code = str(exc)
+        status_code = 428 if code.startswith("task_") else 409
+        raise HTTPException(status_code=status_code, detail=f"Inference authorization is incomplete: {code}.") from exc
+
+    asset = _task_asset(task, db)
+    if asset.kind != "image" or not asset.preview_key or not asset.width or not asset.height:
+        raise HTTPException(status_code=415, detail="Suggestions require an image asset with a readable preview and source pixel dimensions.")
+    try:
+        preview_path = resolve_storage_key(asset.preview_key)
+        if not preview_path.is_file():
+            raise HTTPException(status_code=503, detail="The private task preview is unavailable.")
+        preview_size = preview_path.stat().st_size
+        if preview_size <= 0 or preview_size > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail=f"The provider preview must be no larger than {MAX_IMAGE_BYTES} bytes.")
+        preview_bytes = preview_path.read_bytes()
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="The private task preview could not be read.") from exc
+
+    metadata = asset.asset_metadata or {}
+    source_crs = asset.crs or task.crs
+    try:
+        suggestions = request_provider_suggestions(
+            preview_bytes, config=provider, taxonomy=task.taxonomy,
+            width=asset.width, height=asset.height,
+            affine_transform=metadata.get("affine_transform"), bounds=asset.bounds,
+            source_crs=source_crs,
+        )
+        suggestions = _check_annotation_geojson(task, suggestions, db)
+    except HTTPException as exc:
+        raise HTTPException(status_code=502, detail="Provider candidates failed GeoJSON, taxonomy, or CRS validation.") from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=502, detail="The configured provider did not return valid geospatial suggestions.") from exc
+
+    item = PreAnnotation(
+        task_id=task.id, source="configured_vision_provider", model_version=provider.model,
+        geojson_data=json.dumps(suggestions), status="pending", created_by_user_id=member.user_id,
+    )
+    db.add(item)
+    db.flush()
+    project = db.query(Project).filter(Project.id == task.project_id).first()
+    audit(db, project.organization_id, member.user_id, "preannotation.generated", "preannotation", item.id, {
+        "source": item.source, "model_version": item.model_version,
+        "feature_count": len(suggestions["features"]), "human_review_required": True,
+        "external_data_transfer_confirmed": payload.confirm_data_transfer,
+        "provider_costs_confirmed": payload.confirm_provider_costs,
+    })
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "task_id": task.id, "source": item.source,
+            "model_version": item.model_version, "geojson": item.geojson,
+            "status": item.status, "human_review_required": True, "created_at": item.created_at}

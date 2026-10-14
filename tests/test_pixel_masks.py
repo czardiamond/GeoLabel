@@ -23,6 +23,19 @@ def _mask_png(width, height, painted):
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+def test_rotated_and_sheared_affine_mask_footprint_uses_all_six_coefficients():
+    from backend.mask_utils import polygonize_png_mask
+
+    mask = {"version": 1, "encoding": "image/png;base64", "width": 2, "height": 2,
+            "data": _mask_png(2, 2, {(0, 0)})}
+    geometry = polygonize_png_mask(
+        mask, expected_width=2, expected_height=2,
+        affine_transform=[2, 0.5, 10, 0.25, -3, 20], bounds=None,
+        source_crs="EPSG:4326", target_crs="EPSG:4326",
+    )
+    assert shape(geometry).bounds == (10.0, 17.0, 12.5, 20.25)
+
+
 def test_image_annotation_mask_uses_source_affine_and_task_crs(api_client, tmp_path, monkeypatch):
     client, session_factory = api_client
     from backend.config import settings

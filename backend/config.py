@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     LOGIN_RATE_LIMIT_ATTEMPTS: int = 10
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 900
     LOGIN_RATE_LIMIT_BLOCK_SECONDS: int = 900
+    # Provider-backed inference remains inert until all explicit deployment gates are configured.
+    INFERENCE_ENABLED: bool = False
+    INFERENCE_PROVIDER_BASE_URL: str = ""
+    INFERENCE_ALLOWED_HOSTS: str = ""
+    INFERENCE_MODEL: str = ""
+    INFERENCE_API_KEY: str = ""
+    INFERENCE_DATA_TRANSFER_APPROVED: bool = False
+    INFERENCE_SPEND_APPROVED: bool = False
+    INFERENCE_REQUEST_TIMEOUT_SECONDS: int = 45
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     ENVIRONMENT: str = "development"
