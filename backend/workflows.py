@@ -7,7 +7,9 @@ import mimetypes
 import os
 import shutil
 import socket
+import tempfile
 import uuid
+import zipfile
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,9 +17,10 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 import pyproj
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from backend.asset_storage import (
@@ -30,6 +33,7 @@ from backend.asset_storage import (
     save_temp_asset,
     storage_root,
 )
+from backend.gis_operations import raster_band_statistics, raster_change_analysis, spatial_join
 from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
@@ -38,6 +42,7 @@ from backend.identity import MemberContext, audit, membership_for, notify, requi
 from backend.models import (
     Annotation,
     AnnotationRevision,
+    AuditEvent,
     Asset,
     Dataset,
     GoldStandard,
@@ -46,13 +51,20 @@ from backend.models import (
     PreAnnotation,
     Project,
     Task,
+    TaskAssignment,
     TaskComment,
     UserAccount,
     UserNotification,
     VideoSegmentSubmission,
     utcnow_naive,
 )
-from backend.scoring import build_consensus_geojson, compute_task_iaa, match_features_cohen
+from backend.scoring import (
+    SCORER_VERSION,
+    build_consensus_geojson,
+    compute_task_iaa,
+    match_features_cohen,
+    scoring_configuration,
+)
 
 router = APIRouter(tags=["projects, media, tasks and review"])
 
@@ -140,6 +152,18 @@ class AssignTask(BaseModel):
     user_id: str
 
 
+class AssignWorkers(BaseModel):
+    user_ids: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("user_ids")
+    @classmethod
+    def unique_user_ids(cls, value):
+        clean = [str(user_id).strip() for user_id in value]
+        if any(not user_id for user_id in clean) or len(set(clean)) != len(clean):
+            raise ValueError("user_ids must contain unique non-empty account IDs")
+        return clean
+
+
 class ReserveTask(BaseModel):
     seconds: int = Field(default=900, ge=60, le=86400)
 
@@ -170,6 +194,57 @@ class PreAnnotationInput(BaseModel):
 
 class PreAnnotationDecision(BaseModel):
     decision: str = Field(pattern="^(accept|reject)$")
+
+
+class GeoreferenceRepair(BaseModel):
+    crs: str = Field(min_length=1, max_length=256)
+    bounds: list[float] = Field(min_length=4, max_length=4)
+    rationale: str = Field(min_length=5, max_length=1000)
+
+    @field_validator("crs")
+    @classmethod
+    def valid_crs(cls, value):
+        try:
+            return pyproj.CRS.from_user_input(value).to_string()
+        except Exception as exc:
+            raise ValueError("crs must identify a valid coordinate reference system") from exc
+
+    @field_validator("bounds")
+    @classmethod
+    def valid_bounds(cls, value):
+        try:
+            clean = [float(item) for item in value]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("bounds must contain four numbers") from exc
+        if not all(math.isfinite(item) for item in clean) or clean[0] >= clean[2] or clean[1] >= clean[3]:
+            raise ValueError("bounds must be finite [xmin, ymin, xmax, ymax] with positive area")
+        return clean
+
+
+class SpatialJoinRequest(BaseModel):
+    source_geojson: dict
+    target_geojson: dict
+    source_crs: str = Field(min_length=1, max_length=256)
+    target_crs: str = Field(min_length=1, max_length=256)
+    predicate: str = Field(default="intersects", pattern="^(intersects|contains|within)$")
+
+    @field_validator("source_geojson", "target_geojson")
+    @classmethod
+    def bound_feature_count(cls, value):
+        if not isinstance(value, dict) or not isinstance(value.get("features"), list) or len(value["features"]) > 500:
+            raise ValueError("Each FeatureCollection must contain at most 500 features")
+        return value
+
+
+class RasterStatsRequest(BaseModel):
+    max_pixels: int = Field(default=2_000_000, ge=1, le=25_000_000)
+
+
+class RasterChangeRequest(BaseModel):
+    first_asset_id: str
+    second_asset_id: str
+    threshold: float | None = Field(default=None, ge=0, le=1e12)
+    max_pixels: int = Field(default=2_000_000, ge=1, le=25_000_000)
 
 
 class VideoSegment(BaseModel):
@@ -222,21 +297,29 @@ def _locked_task(db: Session, task_id: str) -> Task:
     return task
 
 
-def _require_task_assignment(task: Task, membership: OrganizationMembership, member: MemberContext) -> None:
+def _require_task_assignment(task: Task, membership: OrganizationMembership, member: MemberContext, db: Session, check_reservation: bool = True) -> None:
     if membership.role != "annotator":
         return
-    if task.assigned_user_id and task.assigned_user_id != member.user_id:
+    assigned_ids = _assigned_user_ids(task, db)
+    if assigned_ids and member.user_id not in assigned_ids:
         raise HTTPException(status_code=403, detail="This task is assigned to another worker.")
-    if task.reserved_until and task.reserved_until > utcnow_naive() and task.reserved_by_user_id != member.user_id:
+    if check_reservation and task.reserved_until and task.reserved_until > utcnow_naive() and task.reserved_by_user_id != member.user_id:
         raise HTTPException(status_code=403, detail="This task is actively reserved by another worker.")
 
 
 def _require_asset_assignment(asset: Asset, membership: OrganizationMembership, member: MemberContext, db: Session) -> None:
     if membership.role != "annotator":
         return
+    explicit_task_ids = db.query(TaskAssignment.task_id).filter(
+        TaskAssignment.user_id == member.user_id, TaskAssignment.active.is_(True)
+    )
     access = db.query(Task.id).filter(
         Task.asset_id == asset.id,
-        ((Task.assigned_user_id == member.user_id) | ((Task.reserved_by_user_id == member.user_id) & (Task.reserved_until > utcnow_naive()))),
+        or_(
+            Task.assigned_user_id == member.user_id,
+            Task.id.in_(explicit_task_ids),
+            and_(Task.reserved_by_user_id == member.user_id, Task.reserved_until > utcnow_naive()),
+        ),
     ).first()
     if not access:
         raise HTTPException(status_code=403, detail="This asset is available only through an assigned or reserved task.")
@@ -254,6 +337,14 @@ def _asset_response(asset: Asset) -> dict:
     }
 
 
+def _assigned_user_ids(task: Task, db: Session) -> set[str]:
+    assigned = {task.assigned_user_id} if task.assigned_user_id else set()
+    assigned.update(row[0] for row in db.query(TaskAssignment.user_id).filter(
+        TaskAssignment.task_id == task.id, TaskAssignment.active.is_(True)
+    ).all())
+    return assigned
+
+
 def _task_response(task: Task, db: Session, include_quality: bool = False) -> dict:
     asset = db.query(Asset).filter(Asset.id == task.asset_id).first() if task.asset_id else None
     response = {
@@ -262,10 +353,13 @@ def _task_response(task: Task, db: Session, include_quality: bool = False) -> di
         "taxonomy": task.taxonomy, "target_annotator_count": task.target_annotator_count,
         "annotation_count": db.query(Annotation).filter(Annotation.task_id == task.id).count(),
         "priority": task.priority, "assigned_user_id": task.assigned_user_id,
+        "assigned_user_ids": sorted(_assigned_user_ids(task, db)),
         "reserved_by_user_id": task.reserved_by_user_id, "reserved_until": task.reserved_until,
         "project_id": task.project_id, "dataset_id": task.dataset_id, "asset_id": task.asset_id,
         "asset": _asset_response(asset) if asset else None,
         "iaa_score": task.iaa_score, "iaa_type": task.iaa_type,
+        "scoring_version": task.scoring_version,
+        "scoring_config": json.loads(task.scoring_config_json) if task.scoring_config_json else None,
         "created_at": task.created_at, "completed_at": task.completed_at,
     }
     if include_quality:
@@ -329,7 +423,8 @@ def _check_annotation_geojson(task: Task, geojson: dict) -> dict:
 def _quality_scores(db: Session, task: Task) -> dict:
     gold = db.query(GoldStandard).filter(GoldStandard.task_id == task.id).first()
     if not gold:
-        return {"available": False, "macro_f1": None, "annotators": []}
+        return {"available": False, "macro_f1": None, "annotators": [],
+                "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration()}
     gold_features = json.loads(gold.geojson_data).get("features", [])
     annotations = db.query(Annotation).filter(Annotation.task_id == task.id).all()
     scores = []
@@ -355,7 +450,9 @@ def _quality_scores(db: Session, task: Task) -> dict:
         })
     macro = sum(row["f1"] for row in scores) / len(scores) if scores else None
     return {"available": True, "macro_f1": round(macro, 4) if macro is not None else None, "annotators": scores,
-            "method": "geometric matching at the scoring module default IoU threshold; category accuracy measured on matches"}
+            "method": "geometric matching at the scoring module default IoU threshold; category accuracy measured on matches",
+            "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
+            "reference_source": "manually supplied task gold standard; not an independently validated dataset"}
 
 
 def _notify_reviewers(db: Session, organization_id: str, author_id: str, task: Task, title: str, message: str):
@@ -407,11 +504,11 @@ def list_datasets(project_id: str, member: MemberContext = Depends(require_membe
     return [{"id": item.id, "project_id": item.project_id, "name": item.name, "description": item.description, "created_at": item.created_at} for item in rows]
 
 
-async def _store_upload(dataset: Dataset, project: Project, filename: str, content_type: str, source: Path, size: int, crs: str | None, bounds: str | None, member: MemberContext, db: Session) -> Asset:
+async def _store_upload(dataset: Dataset, project: Project, filename: str, content_type: str, source: Path, size: int, crs: str | None, bounds: str | None, member: MemberContext, db: Session, world_file_value: str | None = None) -> Asset:
     if size <= 0:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
     try:
-        metadata = inspect_and_preview(source, filename, content_type, crs, bounds)
+        metadata = inspect_and_preview(source, filename, content_type, crs, bounds, world_file_value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     asset_id = f"asset_{uuid.uuid4().hex[:16]}"
@@ -442,6 +539,7 @@ async def upload_asset(
     file: UploadFile = File(...),
     crs: str | None = Form(default=None),
     bounds: str | None = Form(default=None),
+    world_file: UploadFile | None = File(default=None),
     member: MemberContext = Depends(require_member),
     db: Session = Depends(get_db),
 ):
@@ -451,6 +549,7 @@ async def upload_asset(
     max_bytes = max(1, settings.MAX_ASSET_UPLOAD_MB) * 1024 * 1024
     temp_path = new_temp_path()
     size = 0
+    world_file_value = None
     try:
         with temp_path.open("wb") as target:
             while True:
@@ -461,10 +560,20 @@ async def upload_asset(
                 if size > max_bytes:
                     raise HTTPException(status_code=413, detail=f"Asset exceeds the {settings.MAX_ASSET_UPLOAD_MB} MB configured upload limit.")
                 target.write(block)
-        asset = await _store_upload(dataset, project, file.filename or "upload", file.content_type or "application/octet-stream", temp_path, size, crs, bounds, member, db)
+        if world_file:
+            world_bytes = await world_file.read(4097)
+            if len(world_bytes) > 4096:
+                raise HTTPException(status_code=413, detail="World files are limited to 4 KiB.")
+            try:
+                world_file_value = world_bytes.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(status_code=400, detail="World files must be ASCII text.") from exc
+        asset = await _store_upload(dataset, project, file.filename or "upload", file.content_type or "application/octet-stream", temp_path, size, crs, bounds, member, db, world_file_value)
         return _asset_response(asset)
     finally:
         await file.close()
+        if world_file:
+            await world_file.close()
         temp_path.unlink(missing_ok=True)
 
 
@@ -506,9 +615,16 @@ def list_assets(dataset_id: str, member: MemberContext = Depends(require_member)
     query = db.query(Asset).filter(Asset.dataset_id == dataset.id)
     membership = membership_for(db, member.user_id, project.organization_id)
     if membership.role == "annotator":
+        explicit_task_ids = db.query(TaskAssignment.task_id).filter(
+            TaskAssignment.user_id == member.user_id, TaskAssignment.active.is_(True)
+        )
         accessible_assets = db.query(Task.asset_id).filter(
             Task.dataset_id == dataset.id,
-            ((Task.assigned_user_id == member.user_id) | ((Task.reserved_by_user_id == member.user_id) & (Task.reserved_until > utcnow_naive()))),
+            or_(
+                Task.assigned_user_id == member.user_id,
+                Task.id.in_(explicit_task_ids),
+                and_(Task.reserved_by_user_id == member.user_id, Task.reserved_until > utcnow_naive()),
+            ),
         )
         query = query.filter(Asset.id.in_(accessible_assets))
     rows = query.order_by(Asset.created_at.desc()).all()
@@ -619,16 +735,31 @@ def task_queue(
 ):
     membership = membership_for(db, member.user_id, organization_id)
     query = db.query(Task).join(Project, Project.id == Task.project_id).filter(Project.organization_id == organization_id)
+    current_assignment = db.query(TaskAssignment.id).filter(
+        TaskAssignment.task_id == Task.id,
+        TaskAssignment.user_id == member.user_id,
+        TaskAssignment.active.is_(True),
+    ).exists()
+    any_assignment = db.query(TaskAssignment.id).filter(
+        TaskAssignment.task_id == Task.id, TaskAssignment.active.is_(True)
+    ).exists()
     if view == "annotate":
         require_roles(membership, "owner", "admin", "annotator")
         query = query.filter(Task.status.in_(["queued", "in_progress", "revision_requested"]))
-        query = query.filter((Task.assigned_user_id.is_(None)) | (Task.assigned_user_id == member.user_id))
+        if membership.role == "annotator":
+            query = query.filter(or_(
+                Task.assigned_user_id == member.user_id,
+                current_assignment,
+                and_(Task.assigned_user_id.is_(None), ~any_assignment),
+            ))
+        else:
+            query = query.filter((Task.assigned_user_id.is_(None)) | (Task.assigned_user_id == member.user_id))
         query = query.filter((Task.reserved_until.is_(None)) | (Task.reserved_until < utcnow_naive()) | (Task.reserved_by_user_id == member.user_id))
     elif view == "review":
         require_roles(membership, "owner", "admin", "reviewer")
         query = query.filter(Task.review_status == "pending_review")
     elif membership.role == "annotator":
-        query = query.filter((Task.assigned_user_id == member.user_id) | (Task.reserved_by_user_id == member.user_id))
+        query = query.filter(or_(Task.assigned_user_id == member.user_id, current_assignment, Task.reserved_by_user_id == member.user_id))
     if status_filter:
         query = query.filter(Task.status == status_filter)
     if min_priority is not None:
@@ -643,7 +774,7 @@ def task_queue(
 @router.get("/work/tasks/{task_id}")
 def get_work_task(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     return _task_response(task, db)
 
 
@@ -654,7 +785,8 @@ def reserve_task(task_id: str, payload: ReserveTask, member: MemberContext = Dep
     require_roles(membership, "owner", "admin", "annotator")
     if task.status not in {"queued", "in_progress", "revision_requested"}:
         raise HTTPException(status_code=409, detail="This task is not available for annotation.")
-    if task.assigned_user_id and task.assigned_user_id != member.user_id and membership.role not in {"owner", "admin"}:
+    assigned_ids = _assigned_user_ids(task, db)
+    if assigned_ids and member.user_id not in assigned_ids and membership.role not in {"owner", "admin"}:
         raise HTTPException(status_code=409, detail="This task is assigned to another worker.")
     now = utcnow_naive()
     if task.reserved_until and task.reserved_until > now and task.reserved_by_user_id != member.user_id and membership.role not in {"owner", "admin"}:
@@ -684,10 +816,73 @@ def assign_task(task_id: str, payload: AssignTask, member: MemberContext = Depen
     return _task_response(task, db)
 
 
+@router.post("/work/tasks/{task_id}/assignments")
+def add_task_assignments(task_id: str, payload: AssignWorkers, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    task = _locked_task(db, task_id)
+    require_roles(membership, "owner", "admin", "reviewer")
+    if task.status in {"completed", "rejected"} or task.review_status in {"accepted", "rejected"}:
+        raise HTTPException(status_code=409, detail="Closed tasks cannot receive new worker assignments.")
+    current_ids = _assigned_user_ids(task, db)
+    requested = set(payload.user_ids)
+    all_ids = current_ids | requested
+    if len(all_ids) > task.target_annotator_count:
+        raise HTTPException(status_code=409, detail="The number of assigned workers cannot exceed target_annotator_count.")
+    for user_id in payload.user_ids:
+        target = membership_for(db, user_id, membership.organization_id)
+        if target.role not in {"annotator", "admin", "owner"}:
+            raise HTTPException(status_code=400, detail="Tasks can be assigned only to annotators or administrators.")
+    now = utcnow_naive()
+    added = []
+    for user_id in sorted(requested):
+        assignment = db.query(TaskAssignment).filter_by(task_id=task.id, user_id=user_id).first()
+        if assignment and assignment.active:
+            continue
+        if not assignment:
+            assignment = TaskAssignment(task_id=task.id, user_id=user_id, assigned_by_user_id=member.user_id, active=True)
+            db.add(assignment)
+        else:
+            assignment.active = True
+            assignment.assigned_by_user_id = member.user_id
+            assignment.assigned_at = now
+            assignment.deactivated_at = None
+        added.append(user_id)
+        if user_id != member.user_id:
+            notify(db, user_id, "Annotation task assigned", f"You were assigned {task.title or task.id}.", "task", task.id)
+    if task.reserved_by_user_id and task.reserved_by_user_id not in all_ids:
+        task.reserved_by_user_id = None
+        task.reserved_until = None
+    if added:
+        audit(db, membership.organization_id, member.user_id, "task.workers_assigned", "task", task.id, {"user_ids": added})
+    db.commit()
+    return _task_response(task, db)
+
+
+@router.delete("/work/tasks/{task_id}/assignments/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_task_assignment(task_id: str, user_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    task = _locked_task(db, task_id)
+    require_roles(membership, "owner", "admin", "reviewer")
+    if task.assigned_user_id == user_id:
+        raise HTTPException(status_code=409, detail="The legacy scalar assignee must be changed through the existing /assign endpoint.")
+    assignment = db.query(TaskAssignment).filter_by(task_id=task.id, user_id=user_id, active=True).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Active task assignment not found.")
+    has_annotation = db.query(Annotation.id).filter(Annotation.task_id == task.id, Annotation.annotator_id == user_id).first()
+    has_video = db.query(VideoSegmentSubmission.id).filter(VideoSegmentSubmission.task_id == task.id, VideoSegmentSubmission.user_id == user_id).first()
+    if has_annotation or has_video:
+        raise HTTPException(status_code=409, detail="A worker with submitted work cannot be removed; retain the assignment history.")
+    assignment.active = False
+    assignment.deactivated_at = utcnow_naive()
+    audit(db, membership.organization_id, member.user_id, "task.worker_assignment_removed", "task", task.id, {"user_id": user_id})
+    db.commit()
+    return None
+
+
 @router.get("/work/tasks/{task_id}/asset/preview")
 def work_task_asset_preview(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     asset = _task_asset(task, db)
     if not asset.preview_key:
         raise HTTPException(status_code=415, detail="This task asset does not have an image preview.")
@@ -700,7 +895,7 @@ def work_task_asset_preview(task_id: str, member: MemberContext = Depends(requir
 @router.get("/work/tasks/{task_id}/asset/content")
 def work_task_asset_content(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     asset = _task_asset(task, db)
     path = resolve_storage_key(asset.storage_key)
     if not path.is_file():
@@ -729,8 +924,7 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
     require_roles(membership, "owner", "admin", "annotator")
     if task.task_type == "video":
         raise HTTPException(status_code=415, detail="Video tasks use the temporal video-segments endpoint.")
-    if task.assigned_user_id and task.assigned_user_id != member.user_id and membership.role not in {"owner", "admin"}:
-        raise HTTPException(status_code=403, detail="This task is assigned to another worker.")
+    _require_task_assignment(task, membership, member, db, check_reservation=False)
     if task.reserved_by_user_id and task.reserved_until and task.reserved_until > utcnow_naive() and task.reserved_by_user_id != member.user_id and membership.role not in {"owner", "admin"}:
         raise HTTPException(status_code=409, detail="Another worker currently holds this task reservation.")
     if task.review_status in {"accepted", "rejected"}:
@@ -768,6 +962,8 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
         if len(annotations) >= 2:
             ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in annotations]
             task.iaa_score, task.iaa_type = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
+            task.scoring_version = SCORER_VERSION
+            task.scoring_config_json = json.dumps(scoring_configuration(), sort_keys=True, separators=(",", ":"))
     task.reserved_by_user_id = None
     task.reserved_until = None
     project = db.query(Project).filter(Project.id == task.project_id).first()
@@ -782,7 +978,7 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
 @router.get("/work/tasks/{task_id}/annotations")
 def list_task_annotations(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
     return [{"id": row.id, "annotator_id": row.annotator_id, "geojson": row.geojson, "submitted_at": row.submitted_at,
              "review_status": row.review_status, "review_comment": row.review_comment} for row in rows]
@@ -825,13 +1021,13 @@ def review_task(task_id: str, payload: ReviewDecision, member: MemberContext = D
 @router.post("/work/tasks/{task_id}/comments", status_code=status.HTTP_201_CREATED)
 def add_task_comment(task_id: str, payload: CommentCreate, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     comment = TaskComment(task_id=task.id, author_user_id=member.user_id, body=payload.body.strip(),
                           issue_status=payload.kind, status="open" if payload.kind == "issue" else "not_applicable")
     db.add(comment)
     project = db.query(Project).filter(Project.id == task.project_id).first()
-    if task.assigned_user_id and task.assigned_user_id != member.user_id:
-        notify(db, task.assigned_user_id, "Task discussion updated", payload.body.strip()[:240], "task", task.id)
+    for assigned_user_id in _assigned_user_ids(task, db) - {member.user_id}:
+        notify(db, assigned_user_id, "Task discussion updated", payload.body.strip()[:240], "task", task.id)
     _notify_reviewers(db, project.organization_id, member.user_id, task, "Task discussion updated", payload.body.strip()[:240])
     audit(db, project.organization_id, member.user_id, f"task.{payload.kind}.created", "task", task.id)
     db.commit()
@@ -843,7 +1039,7 @@ def add_task_comment(task_id: str, payload: CommentCreate, member: MemberContext
 @router.get("/work/tasks/{task_id}/comments")
 def list_task_comments(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     rows = db.query(TaskComment).filter(TaskComment.task_id == task.id).order_by(TaskComment.created_at.asc()).all()
     return [{"id": row.id, "author_user_id": row.author_user_id, "body": row.body, "kind": row.issue_status,
              "status": row.status, "resolved_by_user_id": row.resolved_by_user_id, "resolved_at": row.resolved_at,
@@ -913,7 +1109,9 @@ def get_task_consensus(task_id: str, member: MemberContext = Depends(require_mem
         consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
     return {"task_id": task.id, "available": available, "annotation_count": len(ann_dicts),
             "required_support": len(ann_dicts) // 2 + 1 if available else None,
-            "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus}
+            "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus,
+            "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
+            "reference_source": "independent worker submissions; agreement is not an accuracy guarantee"}
 
 
 @router.post("/work/tasks/{task_id}/preannotations", status_code=status.HTTP_201_CREATED)
@@ -939,7 +1137,7 @@ def create_preannotation(task_id: str, payload: PreAnnotationInput, member: Memb
 @router.get("/work/tasks/{task_id}/preannotations")
 def list_preannotations(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     rows = db.query(PreAnnotation).filter(PreAnnotation.task_id == task.id).order_by(PreAnnotation.created_at.desc()).all()
     return [{"id": row.id, "source": row.source, "model_version": row.model_version, "geojson": row.geojson,
              "status": row.status, "created_at": row.created_at} for row in rows]
@@ -967,13 +1165,11 @@ def decide_preannotation(preannotation_id: str, payload: PreAnnotationDecision, 
 def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
     task = _locked_task(db, task_id)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     require_roles(membership, "owner", "admin", "annotator")
     asset = _task_asset(task, db)
     if asset.kind != "video" or task.task_type != "video":
         raise HTTPException(status_code=415, detail="Temporal segments can only be submitted for an uploaded video task.")
-    if task.assigned_user_id and task.assigned_user_id != member.user_id and membership.role not in {"owner", "admin"}:
-        raise HTTPException(status_code=403, detail="This task is assigned to another worker.")
     if task.review_status in {"accepted", "rejected"}:
         raise HTTPException(status_code=409, detail="This video task has been closed by review.")
     categories = set(task.taxonomy)
@@ -1021,7 +1217,7 @@ def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: Me
 @router.get("/work/tasks/{task_id}/video-segments")
 def list_video_segments(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member)
+    _require_task_assignment(task, membership, member, db)
     submissions = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id == task.id).order_by(
         VideoSegmentSubmission.user_id.asc(), VideoSegmentSubmission.version.desc()
     ).all()
@@ -1044,3 +1240,248 @@ def legacy_annotator_asset_content(task_id: str, annotator_id: str = Depends(get
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Asset file is missing from configured storage.")
     return FileResponse(path, media_type=asset.content_type, filename=asset.original_filename, content_disposition_type="inline")
+
+
+def _analysis_asset(asset_id: str, member: MemberContext, db: Session, organization_id: str | None = None):
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Raster asset not found.")
+    _, project = _dataset_for_member(db, asset.dataset_id, member)
+    if organization_id and project.organization_id != organization_id:
+        raise HTTPException(status_code=404, detail="Raster asset not found in this organization.")
+    membership = membership_for(db, member.user_id, project.organization_id)
+    require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    if asset.kind != "image" or (asset.asset_metadata or {}).get("driver") != "GeoTIFF":
+        raise HTTPException(status_code=415, detail="This analysis requires a readable GeoTIFF asset with embedded raster metadata.")
+    try:
+        path = resolve_storage_key(asset.storage_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The asset storage key is invalid.") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Raster file is missing from configured storage.")
+    return asset, project, path
+
+
+@router.patch("/assets/{asset_id}/georeference")
+def repair_asset_georeference(asset_id: str, payload: GeoreferenceRepair, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    _, project = _dataset_for_member(db, asset.dataset_id, member)
+    membership = membership_for(db, member.user_id, project.organization_id)
+    require_roles(membership, "owner", "admin", "reviewer")
+    if asset.kind != "image" or (asset.asset_metadata or {}).get("driver") == "GeoTIFF":
+        raise HTTPException(status_code=415, detail="Manual bounds repair is limited to ordinary images; embedded raster affine transforms require a dedicated raster workflow.")
+    if db.query(Task.id).filter(Task.asset_id == asset.id).first():
+        raise HTTPException(status_code=409, detail="Georeference cannot be changed after this asset is linked to a task; create a corrected asset to preserve existing annotation semantics.")
+    old = {"crs": asset.crs, "bounds": asset.bounds}
+    metadata = asset.asset_metadata or {}
+    history = list(metadata.get("georeference_history", []))
+    now = utcnow_naive()
+    history.append({"source": "manual_repair", "actor_user_id": member.user_id,
+                    "rationale": payload.rationale.strip(), "previous": old,
+                    "crs": payload.crs, "bounds": payload.bounds, "updated_at": now.isoformat()})
+    metadata["georeference_history"] = history[-50:]
+    metadata["georeference"] = "manual_repair"
+    asset.crs = payload.crs
+    asset.bounds_json = json.dumps(payload.bounds, separators=(",", ":"))
+    asset.metadata_json = json.dumps(metadata, separators=(",", ":"))
+    audit(db, project.organization_id, member.user_id, "asset.georeference.repaired", "asset", asset.id,
+          {"previous": old, "crs": payload.crs, "bounds": payload.bounds, "rationale": payload.rationale.strip()})
+    db.commit()
+    db.refresh(asset)
+    return _asset_response(asset)
+
+
+@router.post("/organizations/{organization_id}/gis/spatial-join")
+def run_spatial_join(organization_id: str, payload: SpatialJoinRequest, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    membership = membership_for(db, member.user_id, organization_id)
+    require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    try:
+        matches = spatial_join(payload.source_geojson, payload.target_geojson,
+                               payload.source_crs, payload.target_crs, payload.predicate)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, organization_id, member.user_id, "gis.spatial_join", "organization", organization_id,
+          {"predicate": payload.predicate, "match_count": len(matches)})
+    db.commit()
+    return {"source_crs": pyproj.CRS.from_user_input(payload.source_crs).to_string(),
+            "target_crs": pyproj.CRS.from_user_input(payload.target_crs).to_string(),
+            "predicate": payload.predicate, "match_count": len(matches), "matches": matches}
+
+
+@router.post("/assets/{asset_id}/raster/statistics")
+def get_raster_statistics(asset_id: str, payload: RasterStatsRequest, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    asset, project, path = _analysis_asset(asset_id, member, db)
+    try:
+        result = raster_band_statistics(path, max_pixels=payload.max_pixels)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, project.organization_id, member.user_id, "gis.raster_statistics", "asset", asset.id,
+          {"max_pixels": payload.max_pixels})
+    db.commit()
+    return {"asset_id": asset.id, **result}
+
+
+@router.post("/organizations/{organization_id}/gis/raster-change")
+def analyze_raster_change(organization_id: str, payload: RasterChangeRequest, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    first, first_project, first_path = _analysis_asset(payload.first_asset_id, member, db, organization_id)
+    second, second_project, second_path = _analysis_asset(payload.second_asset_id, member, db, organization_id)
+    if first_project.organization_id != second_project.organization_id:
+        raise HTTPException(status_code=404, detail="Both rasters must belong to the same organization.")
+    try:
+        result = raster_change_analysis(first_path, second_path, threshold=payload.threshold, max_pixels=payload.max_pixels)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, organization_id, member.user_id, "gis.raster_change", "asset", first.id,
+          {"second_asset_id": second.id, "threshold": payload.threshold, "max_pixels": payload.max_pixels})
+    db.commit()
+    return {"first_asset_id": first.id, "second_asset_id": second.id, **result}
+
+
+@router.get("/organizations/{organization_id}/export")
+def export_organization(organization_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    """Create a private, bounded ZIP export; credentials and active sessions are never included."""
+    membership = membership_for(db, member.user_id, organization_id)
+    require_roles(membership, "owner", "admin")
+    organization = db.query(Organization).filter(Organization.id == organization_id).first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found.")
+
+    projects = db.query(Project).filter(Project.organization_id == organization_id).order_by(Project.created_at.asc()).all()
+    project_ids = [row.id for row in projects]
+    datasets = db.query(Dataset).filter(Dataset.project_id.in_(project_ids)).order_by(Dataset.created_at.asc()).all() if project_ids else []
+    dataset_ids = [row.id for row in datasets]
+    assets = db.query(Asset).filter(Asset.dataset_id.in_(dataset_ids)).order_by(Asset.created_at.asc()).all() if dataset_ids else []
+    tasks = db.query(Task).filter(Task.project_id.in_(project_ids)).order_by(Task.created_at.asc()).all() if project_ids else []
+    task_ids = [row.id for row in tasks]
+
+    asset_files = []
+    uncompressed_bytes = 0
+    for asset in assets:
+        try:
+            path = resolve_storage_key(asset.storage_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"Asset {asset.id} has an invalid local storage key.") from exc
+        if not path.is_file():
+            raise HTTPException(status_code=409, detail=f"Asset {asset.id} is missing from local storage; export was not created.")
+        file_size = path.stat().st_size
+        uncompressed_bytes += file_size
+        asset_files.append((asset, path, f"assets/{asset.id}/{safe_filename(asset.original_filename)}"))
+
+    def as_json(raw, fallback):
+        try:
+            return json.loads(raw) if raw else fallback
+        except (TypeError, json.JSONDecodeError):
+            return fallback
+
+    def dt(value):
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    memberships = db.query(OrganizationMembership).filter(OrganizationMembership.organization_id == organization_id).all()
+    user_ids = [row.user_id for row in memberships]
+    users = db.query(UserAccount).filter(UserAccount.id.in_(user_ids)).all() if user_ids else []
+    user_by_id = {row.id: row for row in users}
+    assignment_rows = db.query(TaskAssignment).filter(TaskAssignment.task_id.in_(task_ids)).all() if task_ids else []
+    annotation_rows = db.query(Annotation).filter(Annotation.task_id.in_(task_ids)).all() if task_ids else []
+    annotation_ids = [row.id for row in annotation_rows]
+    revisions = db.query(AnnotationRevision).filter(AnnotationRevision.annotation_id.in_(annotation_ids)).all() if annotation_ids else []
+    comments = db.query(TaskComment).filter(TaskComment.task_id.in_(task_ids)).all() if task_ids else []
+    gold_rows = db.query(GoldStandard).filter(GoldStandard.task_id.in_(task_ids)).all() if task_ids else []
+    preannotations = db.query(PreAnnotation).filter(PreAnnotation.task_id.in_(task_ids)).all() if task_ids else []
+    videos = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id.in_(task_ids)).all() if task_ids else []
+    audits = db.query(AuditEvent).filter(AuditEvent.organization_id == organization_id).order_by(AuditEvent.created_at.asc()).all()
+
+    task_assignment_ids: dict[str, list[str]] = {}
+    for row in assignment_rows:
+        if row.active:
+            task_assignment_ids.setdefault(row.task_id, []).append(row.user_id)
+    manifest = {
+        "schema_version": "geolabel-organization-export-v1",
+        "generated_at": utcnow_naive().isoformat(),
+        "organization": {"id": organization.id, "name": organization.name, "created_at": dt(organization.created_at)},
+        "projects": [{"id": x.id, "name": x.name, "description": x.description, "created_at": dt(x.created_at)} for x in projects],
+        "datasets": [{"id": x.id, "project_id": x.project_id, "name": x.name, "description": x.description, "created_at": dt(x.created_at)} for x in datasets],
+        "assets": [{"id": x.id, "dataset_id": x.dataset_id, "filename": x.original_filename,
+                    "archive_path": arc, "content_type": x.content_type, "kind": x.kind,
+                    "size_bytes": x.size_bytes, "width": x.width, "height": x.height,
+                    "crs": x.crs, "bounds": x.bounds, "metadata": x.asset_metadata,
+                    "created_at": dt(x.created_at)} for x, _, arc in asset_files],
+        "tasks": [{"id": x.id, "project_id": x.project_id, "dataset_id": x.dataset_id,
+                   "asset_id": x.asset_id, "title": x.title, "task_type": x.task_type,
+                   "crs": x.crs, "taxonomy": x.taxonomy, "status": x.status,
+                   "review_status": x.review_status, "priority": x.priority,
+                   "target_annotator_count": x.target_annotator_count,
+                   "assigned_user_id": x.assigned_user_id,
+                   "assigned_user_ids": task_assignment_ids.get(x.id, []),
+                   "scoring_version": x.scoring_version,
+                   "scoring_configuration": as_json(x.scoring_config_json, None),
+                   "iaa_score": x.iaa_score, "iaa_type": x.iaa_type,
+                   "created_at": dt(x.created_at), "updated_at": dt(x.updated_at),
+                   "completed_at": dt(x.completed_at)} for x in tasks],
+        "members": [{"user_id": x.user_id, "email": user_by_id[x.user_id].email,
+                     "display_name": user_by_id[x.user_id].display_name,
+                     "is_active": user_by_id[x.user_id].is_active, "role": x.role,
+                     "joined_at": dt(x.created_at)} for x in memberships if x.user_id in user_by_id],
+        "annotations": [{"id": x.id, "task_id": x.task_id, "annotator_id": x.annotator_id,
+                         "geojson": x.geojson, "review_status": x.review_status,
+                         "reviewed_by_user_id": x.reviewed_by_user_id,
+                         "reviewed_at": dt(x.reviewed_at), "review_comment": x.review_comment,
+                         "submitted_at": dt(x.submitted_at)} for x in annotation_rows],
+        "annotation_revisions": [{"id": x.id, "annotation_id": x.annotation_id, "version": x.version,
+                                   "geojson": as_json(x.geojson_data, {}), "review_status": x.review_status,
+                                   "submitted_at": dt(x.submitted_at), "created_at": dt(x.created_at)} for x in revisions],
+        "task_assignments": [{"task_id": x.task_id, "user_id": x.user_id, "active": x.active,
+                              "assigned_by_user_id": x.assigned_by_user_id, "assigned_at": dt(x.assigned_at),
+                              "deactivated_at": dt(x.deactivated_at)} for x in assignment_rows],
+        "comments_and_issues": [{"id": x.id, "task_id": x.task_id, "author_user_id": x.author_user_id,
+                                 "author_annotator_id": x.author_annotator_id, "body": x.body,
+                                 "kind": x.issue_status, "status": x.status,
+                                 "resolved_by_user_id": x.resolved_by_user_id,
+                                 "resolved_at": dt(x.resolved_at), "created_at": dt(x.created_at)} for x in comments],
+        "gold_standards": [{"task_id": x.task_id, "geojson": as_json(x.geojson_data, {}),
+                            "created_by_user_id": x.created_by_user_id, "updated_at": dt(x.updated_at)} for x in gold_rows],
+        "preannotations": [{"id": x.id, "task_id": x.task_id, "source": x.source,
+                            "model_version": x.model_version, "geojson": x.geojson,
+                            "status": x.status, "created_by_user_id": x.created_by_user_id,
+                            "reviewed_by_user_id": x.reviewed_by_user_id,
+                            "created_at": dt(x.created_at), "reviewed_at": dt(x.reviewed_at)} for x in preannotations],
+        "video_segment_submissions": [{"id": x.id, "task_id": x.task_id, "user_id": x.user_id,
+                                       "version": x.version, "segments": x.segments,
+                                       "review_status": x.review_status, "reviewed_by_user_id": x.reviewed_by_user_id,
+                                       "submitted_at": dt(x.submitted_at), "reviewed_at": dt(x.reviewed_at)} for x in videos],
+        "audit_events": [{"id": x.id, "actor_user_id": x.actor_user_id, "actor_kind": x.actor_kind,
+                          "action": x.action, "resource_type": x.resource_type, "resource_id": x.resource_id,
+                          "details": x.details, "created_at": dt(x.created_at)} for x in audits],
+        "exclusions": ["password hashes, API keys, session tokens, invitation token hashes, and runtime secrets"],
+    }
+    manifest_bytes = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    uncompressed_bytes += len(manifest_bytes)
+    limit_bytes = max(1, settings.MAX_ORGANIZATION_EXPORT_MB) * 1024 * 1024
+    if uncompressed_bytes > limit_bytes:
+        raise HTTPException(status_code=413, detail=f"Organization export exceeds the configured {max(1, settings.MAX_ORGANIZATION_EXPORT_MB)} MB uncompressed-size limit.")
+
+    export_dir = storage_root() / ".exports"
+    export_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(export_dir, 0o700)
+    except OSError:
+        pass
+    fd, export_name = tempfile.mkstemp(prefix=f"{organization_id}-", suffix=".zip", dir=export_dir)
+    os.close(fd)
+    export_path = Path(export_name)
+    try:
+        with zipfile.ZipFile(export_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+            for _, path, archive_name in asset_files:
+                archive.write(path, archive_name)
+        audit(db, organization_id, member.user_id, "organization.exported", "organization", organization_id,
+              {"asset_count": len(asset_files), "task_count": len(tasks), "uncompressed_bytes": uncompressed_bytes})
+        db.commit()
+        return FileResponse(export_path, media_type="application/zip",
+                            filename=f"geolabel-{safe_filename(organization.name)}-export.zip",
+                            background=BackgroundTask(os.unlink, export_path))
+    except Exception:
+        export_path.unlink(missing_ok=True)
+        db.rollback()
+        raise

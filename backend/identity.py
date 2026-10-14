@@ -9,7 +9,7 @@ import secrets
 from datetime import timedelta
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models import (
     AuditEvent,
+    AuthThrottle,
     Organization,
     OrganizationInvitation,
     OrganizationMembership,
@@ -248,12 +249,38 @@ def accept_invitation(payload: InvitationAccept, db: Session = Depends(get_db)):
 
 
 @router.post("/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
     email = _normalize_email(str(payload.email))
+    client_ip = request.client.host if request.client else "unknown"
+    subject_hash = _hash_token(f"login\0{email}\0{client_ip}")
+    now = utcnow_naive()
+    window_seconds = max(60, min(int(settings.LOGIN_RATE_LIMIT_WINDOW_SECONDS), 86400))
+    max_failures = max(3, min(int(settings.LOGIN_RATE_LIMIT_ATTEMPTS), 100))
+    throttle = db.query(AuthThrottle).filter(AuthThrottle.subject_hash == subject_hash).with_for_update().first()
+    if throttle and throttle.blocked_until and throttle.blocked_until > now:
+        retry_after = max(1, int((throttle.blocked_until - now).total_seconds()))
+        raise HTTPException(status_code=429, detail="Too many sign-in attempts. Try again later.", headers={"Retry-After": str(retry_after)})
+    if throttle and (now - throttle.window_started_at).total_seconds() >= window_seconds:
+        throttle.window_started_at = now
+        throttle.failed_count = 0
+        throttle.blocked_until = None
     user = db.query(UserAccount).filter(UserAccount.email == email, UserAccount.is_active.is_(True)).first()
     if not user or not _verify_password(payload.password, user.password_hash):
+        if not throttle:
+            throttle = AuthThrottle(subject_hash=subject_hash, window_started_at=now, failed_count=0)
+            db.add(throttle)
+        throttle.failed_count += 1
+        throttle.updated_at = now
+        if throttle.failed_count >= max_failures:
+            throttle.blocked_until = now + timedelta(seconds=max(60, min(int(settings.LOGIN_RATE_LIMIT_BLOCK_SECONDS), 86400)))
+        db.commit()
+        if throttle.blocked_until and throttle.blocked_until > now:
+            retry_after = max(1, int((throttle.blocked_until - now).total_seconds()))
+            raise HTTPException(status_code=429, detail="Too many sign-in attempts. Try again later.", headers={"Retry-After": str(retry_after)})
         raise HTTPException(status_code=401, detail="Email or password is incorrect.")
-    user.last_login_at = utcnow_naive()
+    if throttle:
+        db.delete(throttle)
+    user.last_login_at = now
     access = _issue_session(db, user)
     db.commit()
     return {**access, "user": {"id": user.id, "email": user.email, "display_name": user.display_name}, "organizations": _memberships(db, user.id)}

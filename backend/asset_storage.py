@@ -55,6 +55,29 @@ def parse_bounds(value: str | None) -> list[float] | None:
     return bounds
 
 
+def parse_world_file(value: str, width: int, height: int) -> tuple[list[float], list[float]]:
+    """Return axis-aligned bounds and the six standard A,D,B,E,C,F coefficients."""
+    try:
+        coefficients = [float(line.strip()) for line in value.splitlines() if line.strip()]
+    except ValueError as exc:
+        raise ValueError("world file must contain six numeric A,D,B,E,C,F coefficients") from exc
+    if len(coefficients) != 6 or not all(math.isfinite(item) for item in coefficients):
+        raise ValueError("world file must contain six finite numeric A,D,B,E,C,F coefficients")
+    a, d, b, e, c, f = coefficients
+    if width <= 0 or height <= 0 or abs(a * e - b * d) < 1e-15:
+        raise ValueError("world file has invalid image dimensions or a singular affine transform")
+    corners = [
+        (a * col + b * row + c, d * col + e * row + f)
+        for col, row in ((-0.5, -0.5), (width - 0.5, -0.5),
+                         (width - 0.5, height - 0.5), (-0.5, height - 0.5))
+    ]
+    bounds = [min(x for x, _ in corners), min(y for _, y in corners),
+              max(x for x, _ in corners), max(y for _, y in corners)]
+    if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+        raise ValueError("world file affine transform produced invalid image bounds")
+    return bounds, coefficients
+
+
 def normalize_crs(value: str | None) -> str | None:
     if value is None or not value.strip():
         return None
@@ -108,7 +131,8 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
         return width, height, crs, bounds
 
 
-def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value: str | None, bounds_value: str | None) -> dict:
+def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value: str | None,
+                        bounds_value: str | None, world_file_value: str | None = None) -> dict:
     """Validate file bytes and return persisted metadata plus an optional preview path."""
     declared = (content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream").lower().split(";")[0].strip()
     supplied_crs = normalize_crs(crs_value)
@@ -149,6 +173,8 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
         raise ValueError("Supported uploads are GeoTIFF, PNG, JPEG, WebP, BMP, MP4, WebM, and MOV")
 
     if _is_tiff(path, declared, filename):
+        if world_file_value:
+            raise ValueError("GeoTIFF uploads use their embedded affine transform; sidecar world files are supported only for ordinary images")
         try:
             width, height, raster_crs, raster_bounds = _raster_preview(path, preview_path)
         except Exception as exc:
@@ -179,12 +205,23 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
             image.save(preview_path, format="PNG", optimize=True)
     except (UnidentifiedImageError, OSError) as exc:
         raise ValueError("The upload is not a readable image") from exc
-    if not supplied_crs or not supplied_bounds:
+    world_bounds = None
+    world_coefficients = None
+    if world_file_value:
+        world_bounds, world_coefficients = parse_world_file(world_file_value, width, height)
+        if supplied_bounds and any(abs(a - b) > max(1e-8, abs(a) * 1e-8) for a, b in zip(supplied_bounds, world_bounds)):
+            preview_path.unlink(missing_ok=True)
+            raise ValueError("The supplied bounds conflict with the uploaded world file")
+    final_bounds = world_bounds or supplied_bounds
+    if not supplied_crs or not final_bounds:
         preview_path.unlink(missing_ok=True)
-        raise ValueError("A non-georeferenced image requires both crs and bounds; coordinates are never guessed")
+        raise ValueError("An ordinary image requires a CRS and either explicit bounds or a valid six-line world file; coordinates are never guessed")
+    metadata = {"georeference": "world_file" if world_file_value else "explicit_bounds"}
+    if world_coefficients:
+        metadata["world_file_coefficients"] = world_coefficients
     return {"kind": "image", "content_type": declared, "width": width, "height": height,
-            "crs": supplied_crs, "bounds": supplied_bounds, "preview_path": preview_path,
-            "metadata": {"georeference": "explicit_bounds"}}
+            "crs": supplied_crs, "bounds": final_bounds, "preview_path": preview_path,
+            "metadata": metadata}
 
 
 def make_storage_paths(organization_id: str, asset_id: str, filename: str) -> tuple[Path, str]:

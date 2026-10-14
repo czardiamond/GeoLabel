@@ -1,7 +1,9 @@
 """GeoLabel Task Management FastAPI Server."""
 
 import logging
+import json
 import secrets
+import uuid
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -14,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.auth import generate_annotator_credentials, get_current_annotator
+from backend.asset_storage import storage_root
 from backend.config import settings
 from backend.database import get_db
 from backend.geo_utils import reproject_feature_collection
@@ -30,7 +33,7 @@ from backend.schemas import (
     TaskResultsResponse,
     WebhookRegister,
 )
-from backend.scoring import build_consensus_geojson, compute_task_iaa
+from backend.scoring import build_consensus_geojson, compute_task_iaa, scoring_configuration, SCORER_VERSION
 from backend.identity import router as identity_router
 from backend.workflows import router as workflows_router
 
@@ -121,13 +124,27 @@ def health_check():
 
 @app.get("/health/ready")
 def readiness_check(db: Session = Depends(get_db)):
-    """Readiness probe that checks database connectivity."""
+    """Readiness probe for database and configured local asset storage."""
     try:
         db.execute(text("SELECT 1"))
     except Exception as exc:
         logger.exception("Database readiness check failed")
         raise HTTPException(status_code=503, detail="Database is not ready") from exc
-    return {"status": "ready", "service": "geolabel-backend", "version": settings.VERSION}
+    probe = None
+    try:
+        root = storage_root()
+        probe = root / f".health-check-{uuid.uuid4().hex}"
+        probe.write_bytes(b"geolabel-storage-ready")
+        if probe.read_bytes() != b"geolabel-storage-ready":
+            raise OSError("storage readiness marker did not round-trip")
+    except Exception as exc:
+        logger.exception("Local asset storage readiness check failed")
+        raise HTTPException(status_code=503, detail="Configured local asset storage is not ready") from exc
+    finally:
+        if probe:
+            probe.unlink(missing_ok=True)
+    return {"status": "ready", "service": "geolabel-backend", "version": settings.VERSION,
+            "asset_storage": "writable_local"}
 
 
 @app.get("/")
@@ -360,6 +377,8 @@ def submit_annotation(
         if len(all_annotations) >= task.target_annotator_count:
             ann_dicts = [{"annotator_id": item.annotator_id, "geojson": item.geojson} for item in all_annotations]
             task.iaa_score, task.iaa_type = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
+            task.scoring_version = SCORER_VERSION
+            task.scoring_config_json = json.dumps(scoring_configuration(), sort_keys=True, separators=(",", ":"))
             task.status = "completed"
             task.completed_at = utcnow_naive()
 

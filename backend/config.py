@@ -16,7 +16,11 @@ class Settings(BaseSettings):
     IMAGERY_ALLOWED_HOSTS: str = ""
     ASSET_STORAGE_DIR: str = "./geolabel-assets"
     MAX_ASSET_UPLOAD_MB: int = 512
+    MAX_ORGANIZATION_EXPORT_MB: int = 2048
     USER_SESSION_HOURS: int = 12
+    LOGIN_RATE_LIMIT_ATTEMPTS: int = 10
+    LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 900
+    LOGIN_RATE_LIMIT_BLOCK_SECONDS: int = 900
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     ENVIRONMENT: str = "development"

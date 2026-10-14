@@ -89,6 +89,18 @@ class UserSession(Base):
     revoked_at = Column(DateTime, nullable=True)
 
 
+class AuthThrottle(Base):
+    """Persistent, privacy-preserving login failure window keyed by a digest."""
+    __tablename__ = "auth_throttles"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    subject_hash = Column(String(64), nullable=False, unique=True, index=True)
+    window_started_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    failed_count = Column(Integer, nullable=False, default=0)
+    blocked_until = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 
@@ -201,6 +213,8 @@ class Task(Base):
     reserved_by_user_id = Column(String, ForeignKey("user_accounts.id"), nullable=True)
     reserved_until = Column(DateTime, nullable=True)
     review_status = Column(String(32), nullable=False, default="not_started")
+    scoring_version = Column(String(64), nullable=True)
+    scoring_config_json = Column(Text, nullable=True)
 
     annotations = relationship("Annotation", back_populates="task", cascade="all, delete-orphan")
 
@@ -214,6 +228,20 @@ class Task(Base):
     @taxonomy.setter
     def taxonomy(self, value):
         self.taxonomy_json = json.dumps(value)
+
+
+class TaskAssignment(Base):
+    """Explicit additive worker assignment; legacy Task.assigned_user_id remains valid."""
+    __tablename__ = "task_assignments"
+    __table_args__ = (UniqueConstraint("task_id", "user_id", name="uq_task_assignment_worker"),)
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("user_accounts.id"), nullable=False, index=True)
+    assigned_by_user_id = Column(String, ForeignKey("user_accounts.id"), nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    assigned_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    deactivated_at = Column(DateTime, nullable=True)
 
 
 class Annotation(Base):

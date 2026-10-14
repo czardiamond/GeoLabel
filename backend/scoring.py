@@ -3,6 +3,7 @@
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 import math
+import json
 
 from pyproj import CRS, Transformer
 from shapely import transform as shapely_transform
@@ -13,6 +14,23 @@ from shapely.geometry.base import BaseGeometry
 DEFAULT_LINE_BUFFER = 0.5
 DEFAULT_POINT_DISTANCE_THRESHOLD = 0.5
 DEFAULT_IOU_THRESHOLD = 0.5
+SCORER_VERSION = "geolabel-heuristic-v1"
+
+
+def scoring_configuration() -> Dict[str, Any]:
+    """Return the explicit, serializable configuration for this heuristic scorer."""
+    return {
+        "version": SCORER_VERSION,
+        "iou_threshold": DEFAULT_IOU_THRESHOLD,
+        "line_buffer_m": DEFAULT_LINE_BUFFER,
+        "point_distance_threshold_m": DEFAULT_POINT_DISTANCE_THRESHOLD,
+        "consensus_support": "strict_majority",
+        "tie_break": "canonical_geojson_then_index",
+    }
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _safe_shape(geom_dict: Dict[str, Any]) -> Optional[BaseGeometry]:
@@ -98,7 +116,7 @@ def compute_iou(
 
 
 def _greedy_global_match(candidates: List[Tuple[float, Any, Any]]) -> List[Tuple[Any, Any]]:
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
     used_left, used_right, matches = set(), set(), []
     for score, left, right in candidates:
         if left in used_left or right in used_right:
@@ -115,6 +133,10 @@ def match_features_cohen(
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     crs: str = "EPSG:3857",
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    # Canonical feature order makes equal-overlap greedy matches independent of
+    # client feature-array ordering while preserving the original feature data.
+    features_a = sorted(features_a, key=_stable_json)
+    features_b = sorted(features_b, key=_stable_json)
     candidates = []
     for idx_a, feature_a in enumerate(features_a):
         for idx_b, feature_b in enumerate(features_b):
@@ -196,7 +218,11 @@ def cluster_features_fleiss(
     crs: str = "EPSG:3857",
 ) -> List[Dict[int, Dict[str, Any]]]:
     """Greedily match each rater's objects without transitive overlap chaining."""
-    rater_features = [ann.get("geojson", {}).get("features", []) for ann in annotations]
+    ordered_annotations = sorted(annotations, key=lambda ann: (str(ann.get("annotator_id", "")), _stable_json(ann.get("geojson", {}))))
+    rater_features = [
+        sorted(ann.get("geojson", {}).get("features", []), key=_stable_json)
+        for ann in ordered_annotations
+    ]
     seed_idx = next((idx for idx, features in enumerate(rater_features) if features), None)
     if seed_idx is None:
         return []
@@ -289,16 +315,19 @@ def build_consensus_geojson(
             str(feature.get("properties", {}).get("category", "default_category"))
             for feature in cluster.values()
         )
-        category, category_support = category_counts.most_common(1)[0]
+        category, category_support = min(category_counts.items(), key=lambda item: (-item[1], item[0]))
         if category_support < required_support:
             continue
 
-        features = list(cluster.values())
+        features = sorted(cluster.values(), key=_stable_json)
         representative = max(
             features,
-            key=lambda candidate: sum(
-                compute_iou(candidate.get("geometry", {}), other.get("geometry", {}), crs=crs)
-                for other in features
+            key=lambda candidate: (
+                sum(
+                    compute_iou(candidate.get("geometry", {}), other.get("geometry", {}), crs=crs)
+                    for other in features
+                ),
+                _stable_json(candidate),
             ),
         )
         feature_copy = dict(representative)

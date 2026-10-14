@@ -1,8 +1,10 @@
 from backend.geo_utils import reproject_feature_collection
 from backend.scoring import (
+    _greedy_global_match,
     build_consensus_geojson,
     calculate_cohens_kappa,
     compute_iou,
+    scoring_configuration,
 )
 
 
@@ -69,3 +71,29 @@ def test_geojson_coordinates_are_reprojected_to_task_crs():
     assert abs(x - 111319.49) < 1
     assert abs(y - 111325.14) < 1
     assert result["crs"]["properties"]["name"] == "EPSG:3857"
+
+
+def test_scorer_exposes_versioned_explicit_configuration():
+    config = scoring_configuration()
+    assert config["version"].startswith("geolabel-heuristic-")
+    assert config["iou_threshold"] == 0.5
+    assert config["consensus_support"] == "strict_majority"
+    assert config["tie_break"]
+
+
+def test_consensus_tie_is_stable_and_does_not_fabricate_a_majority():
+    rows = [
+        {"annotator_id": "a", "geojson": {"type": "FeatureCollection", "features": [polygon(0, "road")]}},
+        {"annotator_id": "b", "geojson": {"type": "FeatureCollection", "features": [polygon(0, "building")]}},
+        {"annotator_id": "c", "geojson": {"type": "FeatureCollection", "features": [polygon(0, "road")]}},
+        {"annotator_id": "d", "geojson": {"type": "FeatureCollection", "features": [polygon(0, "building")]}},
+    ]
+    first = build_consensus_geojson(rows, iaa_score=0.0, crs="EPSG:4326")
+    second = build_consensus_geojson(list(reversed(rows)), iaa_score=0.0, crs="EPSG:4326")
+    assert first == second
+    assert first["features"] == []
+
+
+def test_equal_score_matching_uses_stable_index_tie_break():
+    candidates = [(0.8, 1, 1), (0.8, 0, 1), (0.8, 0, 0)]
+    assert _greedy_global_match(candidates) == [(0, 0), (1, 1)]

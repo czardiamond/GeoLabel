@@ -69,11 +69,11 @@ def test_bootstrap_migrates_existing_unversioned_database_without_losing_records
     assert task == ("task_existing", "in_progress")
     assert annotation == ("annotation_existing",)
     assert "task_id" in key_columns
-    assert {"project_id", "asset_id", "priority", "review_status", "task_type"}.issubset(task_columns)
+    assert {"project_id", "asset_id", "priority", "review_status", "task_type", "scoring_version", "scoring_config_json"}.issubset(task_columns)
     assert {"review_status", "reviewed_at", "review_comment"}.issubset(annotation_columns)
-    assert {"organizations", "projects", "datasets", "assets", "organization_memberships", "audit_events", "task_comments"}.issubset(new_tables)
+    assert {"organizations", "projects", "datasets", "assets", "organization_memberships", "audit_events", "task_comments", "task_assignments", "auth_throttles"}.issubset(new_tables)
     assert migrated.execute("SELECT review_status FROM tasks WHERE id='task_existing'").fetchone() == ("not_started",)
     assert migrated.execute("SELECT review_status FROM annotations WHERE id='annotation_existing'").fetchone() == ("pending",)
     assert quote_table is not None
-    assert version == ("0002_workspaces_assets_review",)
+    assert version == ("0003_assignments_scoring_auth",)
     migrated.close()

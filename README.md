@@ -20,7 +20,7 @@ GeoLabel is a geospatial annotation service with a backward-compatible GeoJSON A
 - Organization membership checks on the new project, dataset, asset, queue, review, and quality routes. Legacy service-key routes remain deployment-wide for compatibility and should not be shared with workers.
 - Invitation tokens are returned once with `delivery: "manual"`; there is no transactional email provider in this branch. Deliver invitation tokens through an approved channel and treat them as secrets.
 - Persistent audit events for organization, invitation, project, dataset, asset, task, annotation, review, gold-standard, and pre-annotation operations. In-app notifications are stored and can be marked read.
-- Audit records are currently append-only through the API, but there is no retention scheduler or export/deletion workflow.
+- Audit records are append-only through the API. Owner/admins can create a private organization ZIP export with workflow data, media and audit provenance; credentials are excluded. This is not a deletion or retention policy.
 
 Initial owner setup uses the configured service key:
 
@@ -33,26 +33,26 @@ curl -X POST http://localhost:8000/organizations \
 
 The response contains a one-time `invitation_token` for the owner. The owner accepts it in the workspace UI or via `POST /auth/invitations/accept` with `token`, `display_name`, and a password of at least 12 characters. Sign-in is then through `POST /auth/login`. Account creation is invitation-only; no public sign-up or password-reset email is provided.
 
-Passwords are hashed with PBKDF2-HMAC-SHA-256 and random salts. Session tokens are random opaque values stored by SHA-256 digest and expire after `USER_SESSION_HOURS` (default 12, capped at 168); logout revokes the current session. Login rate limiting, email verification, password reset, MFA, SSO, LDAP, SCIM, and an external identity-provider adapter are not implemented.
+Passwords are hashed with PBKDF2-HMAC-SHA-256 and random salts. Session tokens are random opaque values stored by SHA-256 digest and expire after `USER_SESSION_HOURS` (default 12, capped at 168); logout revokes the current session. Login attempts are throttled in the database by a privacy-preserving email/IP digest. Email verification, password-reset email, MFA, SSO/OIDC, LDAP, SCIM, and an external identity-provider adapter are not implemented.
 
 ### Projects, datasets, assets, and task queues
 
 - Organization-scoped projects and datasets; uploaded assets are organized in datasets.
 - Private local image/raster uploads, GeoTIFF metadata extraction (CRS, bounds, dimensions), and server-generated PNG previews. GeoTIFF content is read with Rasterio; an image upload is decoded and previewed with Pillow.
-- PNG/JPEG/WebP/BMP uploads are accepted only when the caller supplies both a valid CRS and `[xmin, ymin, xmax, ymax]` bounds. **GeoLabel does not guess georeferencing.** GeoTIFF embedded georeferencing takes precedence; contradictory supplied metadata is rejected.
+- PNG/JPEG/WebP/BMP uploads require a valid CRS and either explicit `[xmin, ymin, xmax, ymax]` bounds or a standard six-line world file (A,D,B,E,C,F). Pixel-center affine coefficients are converted to an axis-aligned footprint, including rotated transforms. **GeoLabel does not infer coordinates from image pixels.** GeoTIFF embedded georeferencing takes precedence; contradictory metadata is rejected. Ordinary-image CRS/bounds can be repaired before task linkage with required rationale and provenance; embedded GeoTIFF transforms are not overwritten.
 - MP4/WebM/MOV assets can be uploaded and streamed privately for browser-native playback. Temporal segments are stored as millisecond ranges, categories, and notes. Actual video playback depends on the end user's browser and codec support.
 - Remote HTTPS import is opt-in by exact-host allowlist (`IMAGERY_ALLOWED_HOSTS`). Imports reject embedded credentials, non-public DNS results, redirects, and files over the configured upload limit. Allowlisted remote downloads are copied into local private storage; the source URL is not retained in the asset record.
-- Task creation from one asset or a dataset batch; priority ordering, named assignment, time-bounded reservations, and separate annotate/review queues.
-- For unassigned tasks with a target greater than one, each annotator submits independently; reservations are released on submission, review is held until the target count is met, and reviewer notifications are sent only when the task is ready.
+- Task creation from one asset or a dataset batch; priority ordering, named assignment, multiple explicit worker assignments, time-bounded reservations, and separate annotate/review queues.
+- Independently assigned workers submit separately; unassigned tasks can also accept independent submissions. Reservations are released on submission, review is held until the target count is met, and reviewer notifications are sent only when all required workers are ready.
 - Private asset content/previews are served only to a member of the matching organization or to a valid annotator key assigned to that task.
 
-**Storage is local filesystem storage**, configured with `ASSET_STORAGE_DIR` (default `./geolabel-assets`). For any deployed or multi-instance service, mount an access-controlled persistent volume and back it up. This release does not include S3/GCS credentialed adapters, cloud lifecycle management, object-store encryption configuration, distributed locking, or shared-storage health checks. A valid allowlisted public HTTPS object URL can be imported; `s3://` and `gs://` URI imports explicitly return a configuration error rather than pretending to work.
+**Storage is local filesystem storage**, configured with `ASSET_STORAGE_DIR` (default `./geolabel-assets`). `/health/ready` checks database connectivity and that this local path can write/read/remove a probe; it does not prove consistency across shared mounts or instances. S3/GCS adapters, object lifecycle/encryption configuration, and distributed locking are not configured. A valid allowlisted public HTTPS object URL can be imported; `s3://` and `gs://` imports return a configuration error rather than pretending to work.
 
-Uploads stream to disk and are limited by `MAX_ASSET_UPLOAD_MB` (default 512 MB). The API validates supported types and image bytes, but the deployment still needs proxy/request limits, malware scanning appropriate to its threat model, disk quotas, and operational cleanup/retention.
+Uploads stream to disk and are limited by `MAX_ASSET_UPLOAD_MB` (default 512 MB). Organization exports are capped by `MAX_ORGANIZATION_EXPORT_MB` (default 2048 MB uncompressed). `python -m backend.backup --output /protected/path/geolabel-backup.zip` creates a no-overwrite SQLite plus local-media snapshot and verifies SQLite integrity. The ZIP is unencrypted and contains sensitive database contents; protect it and encrypt it separately if required. PostgreSQL/cloud backups, malware scanning, quotas, retention/deletion, proxy limits, and monitoring still need deployment/provider policy and tooling.
 
 ### Browser annotation and team review
 
-- Authenticated in-browser raster/image viewing with drawing for bounding boxes, polygons, polylines, points, keypoints, and freehand vector mask outlines (exported as GeoJSON polygons); features can be categorized, removed, imported, and exported. This is not a pixel-level brush-mask editor.
+- Authenticated in-browser image/raster viewing supports boxes, polygons, polylines, points, keypoints, multipart geometry display, and draggable vertices. Closed rings and extra coordinate dimensions are preserved. The brush remains a vector outline exported as GeoJSON; **pixel-level masks and rasterized brush editing are not implemented**.
 - Temporal video-segment annotation for uploaded video assets, with playhead-derived time ranges, category and notes; reviewers can see each submitter's ranges and seek playback to inspect them.
 - Annotation submission remains GeoJSON-first and preserves the task CRS and existing reprojection behavior.
 - Reviewer queue with explicit accept/reject/rework decisions. A rework resubmission replaces the current annotation while a prior version is retained in `annotation_revisions`.
@@ -61,7 +61,7 @@ Uploads stream to disk and are limited by `MAX_ASSET_UPLOAD_MB` (default 512 MB)
 - Organization reviewers can inspect majority-supported consensus GeoJSON and inter-annotator agreement from the independent submissions; a consensus requires at least two annotations and uses the existing heuristic spatial matching/support threshold.
 - Reviewable pre-annotation records can be imported from an external provider, reviewed/accepted/rejected, and retrieved by workers.
 
-The scoring implementation is **heuristic**, using the existing geospatial feature matcher at its default IoU threshold. Gold-set scores depend on the correctness and representativeness of the gold data; they are not independently validated quality guarantees and should not be used as a compliance attestation. Agreement/consensus outputs remain heuristic too.
+The scoring implementation is **heuristic**, using the existing geospatial feature matcher at its default IoU threshold. Scorer version/configuration are persisted and category-tie behavior is deterministic. Gold-set scores depend on the correctness and representativeness of supplied gold data; they are not independently validated quality guarantees or a compliance attestation. Agreement/consensus outputs remain heuristic.
 
 The pre-annotation API only stores and reviews provider-supplied candidate GeoJSON. **It does not run AI detection, tracking, or segmentation models.** No GeoLabel inference adapter/model selection, data-transfer approval, inference runtime, or accuracy evaluation plan is configured in this repository task; general-purpose model credentials elsewhere in an environment are not wired to these routes. Do not tell annotators that imported suggestions were generated by GeoLabel itself.
 
@@ -69,8 +69,8 @@ The pre-annotation API only stores and reviews provider-supplied candidate GeoJS
 
 | Role | Main permissions |
 |---|---|
-| `owner` | Organization administration, project/dataset/task setup, assignment, annotation, review, gold data, audit |
-| `admin` | Organization administration except changing an owner role, project/task setup, assignment, annotation and review |
+| `owner` | Organization administration, project/dataset/task setup, assignment, annotation, review, gold data, audit, export |
+| `admin` | Organization administration except changing an owner role, project/task setup, assignment, annotation, review, audit and export |
 | `annotator` | Read assigned/reserved work, reserve eligible tasks, submit annotation/video segments, discuss issues |
 | `reviewer` | Review queue, task assignment/reassignment, accept/reject/rework, gold data, consensus/quality review, imported pre-annotation review, task discussion |
 | `analyst` | Read organization data and quality metrics; no task creation, annotation or review actions |
@@ -92,7 +92,7 @@ WEBHOOK_ALLOWED_HOSTS=
 CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 ```
 
-`IMAGERY_ALLOWED_HOSTS` and `WEBHOOK_ALLOWED_HOSTS` are comma-separated exact hostnames. Leave the imagery list empty to disable remote imports. Do not put cloud credentials in URLs. SSO/LDAP/MFA and cloud object storage require provider selection and credentials/configuration that are not supplied in this branch.
+`IMAGERY_ALLOWED_HOSTS` and `WEBHOOK_ALLOWED_HOSTS` are comma-separated exact hostnames. Leave the imagery list empty to disable remote imports. `LOGIN_RATE_LIMIT_ATTEMPTS`, `LOGIN_RATE_LIMIT_WINDOW_SECONDS`, and `LOGIN_RATE_LIMIT_BLOCK_SECONDS` configure login throttling; `MAX_ORGANIZATION_EXPORT_MB` bounds exports. Do not put cloud credentials in URLs. SSO/LDAP/MFA and cloud storage require provider selection and credentials/configuration not supplied here.
 
 ## Local development
 
@@ -116,7 +116,7 @@ npm ci
 npm run dev
 ```
 
-The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check; `/health/ready` checks database connectivity. Only `VITE_`-prefixed values are exposed to the browser. Never put the service key in a `VITE_` variable. User sessions are held in component memory by the web UI and are cleared on logout/page close.
+The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check; `/health/ready` checks the database and local storage write/read/delete readiness. Only `VITE_`-prefixed values are exposed to the browser. Never put the service key in a `VITE_` variable. User sessions are held in component memory and cleared on logout/page close.
 
 ## Main API routes
 
@@ -129,16 +129,19 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `POST` | `/organizations/{id}/invitations` | Owner/admin | Create a manual-delivery invitation |
 | `GET` | `/organizations/{id}/members` | Owner/admin/reviewer | List organization members needed for task assignment |
 | `GET` | `/organizations/{id}/audit` | Owner/admin | List audit events |
+| `GET` | `/organizations/{id}/export` | Owner/admin | Create bounded ZIP export with assets and workflow records |
 | `POST` | `/organizations/{id}/projects` | Owner/admin | Create a project |
 | `POST` | `/projects/{id}/datasets` | Owner/admin | Create a dataset |
 | `POST` | `/datasets/{id}/assets` | Owner/admin | Upload a georeferenced image/raster or video |
 | `POST` | `/datasets/{id}/assets/import` | Owner/admin | Import an allowlisted public HTTPS source |
+| `PATCH` | `/assets/{id}/georeference` | Owner/admin/reviewer | Repair ordinary-image CRS/bounds before task linkage |
 | `GET` | `/datasets/{id}/assets` | Organization member | List dataset assets |
 | `POST` | `/projects/{id}/tasks` | Owner/admin | Create a task on one asset |
 | `POST` | `/datasets/{id}/tasks/batch` | Owner/admin | Create tasks for an asset batch |
 | `GET` | `/organizations/{id}/queue` | Role-scoped | Annotate or review queue with priority/quality filters |
 | `POST` | `/work/tasks/{id}/reserve` | Annotator | Lease an eligible task |
 | `POST` | `/work/tasks/{id}/assign` | Owner/admin/reviewer | Assign or reassign one worker |
+| `POST` | `/work/tasks/{id}/assignments` | Owner/admin/reviewer | Add independent task workers |
 | `POST` | `/work/tasks/{id}/annotations` | Assigned organization user | Submit geospatial annotation |
 | `POST` | `/work/tasks/{id}/video-segments` | Assigned organization user | Submit temporal video segments |
 | `POST` | `/work/tasks/{id}/review` | Reviewer/admin | Accept, reject or request rework |
@@ -146,6 +149,9 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `PUT` | `/work/tasks/{id}/gold-standard` | Reviewer/admin | Save independent reference data |
 | `GET` | `/work/tasks/{id}/quality` | Reviewer/admin/analyst | Per-annotator gold-set metrics |
 | `GET` | `/work/tasks/{id}/consensus` | Owner/admin/reviewer/analyst | Majority-supported GeoJSON and inter-annotator agreement |
+| `POST` | `/organizations/{id}/gis/spatial-join` | Owner/admin/reviewer/analyst | CRS-aware local GeoJSON spatial join |
+| `POST` | `/assets/{id}/raster/statistics` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF band statistics |
+| `POST` | `/organizations/{id}/gis/raster-change` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF change analysis |
 | `POST` / `GET` | `/work/tasks/{id}/preannotations` | Reviewer/admin / task member | Import/list reviewable provider suggestions |
 | `POST` | `/work/preannotations/{id}/decision` | Reviewer/admin | Accept/reject a suggestion |
 | `POST` | `/tasks` | Service key | Legacy task creation |
@@ -157,7 +163,7 @@ Both user-session and annotator-key asset routes are protected; browser clients 
 
 ## Backward-compatible migrations
 
-Apply `alembic upgrade head` before starting an upgraded installation. `0002_workspaces_assets_review` is additive: it adds nullable/defaulted project, asset, priority and review columns to existing tasks, adds review metadata to existing annotations, and creates new identity, dataset, asset, revision, notification, audit, gold, pre-annotation and video tables. It does not recreate or delete existing task, credential, quote or annotation rows. The project/dataset/asset columns on legacy tasks remain empty; old task flows continue to use their original fields.
+Apply `alembic upgrade head` before starting an upgraded installation. `0002_workspaces_assets_review` and `0003_assignments_scoring_auth` are additive: they preserve existing tasks and annotations while adding organization workflows, explicit assignments, scorer provenance, and DB-backed login throttle records. Legacy task project/dataset/asset columns remain empty; old flows continue to use their original fields.
 
 Automatic downgrade is deliberately disabled because deleting new account/media/review tables or columns could discard user data. Back up the database and asset directory before production migration. Test database restore and migration behavior in a copy of real data first.
 
@@ -172,15 +178,16 @@ npm run lint
 npm run build
 ```
 
-The integration tests exercise legacy API compatibility, data-preserving migrations, organization isolation, GeoTIFF CRS/bounds extraction and private previews, private media access across assignment/reassignment, dataset batches, independent multi-annotator submissions and reservation release, consensus/IAA, analyst score filtering and role denial, annotation, gold scoring, comments, pre-annotation decisions, rework history, final review, video timing, and in-app notifications.
+The tests exercise legacy compatibility and migrations, organization isolation, GeoTIFF/world-file ingestion and repair, private media and multi-worker assignment, independent submissions, scorer provenance, login throttling, GIS joins/statistics/change, export secret exclusion, local readiness, SQLite/media backup integrity, review/rework, video timing, and notifications.
 
 ## Operational boundaries before production
 
-- Add an explicit identity-provider choice if SSO, LDAP, MFA, SCIM, password recovery, or email delivery is required.
-- Configure durable private asset storage shared by all API instances; add backup/restore, encryption, retention/deletion, quotas, malware scanning, and monitoring.
-- Add request rate limiting, login/invitation brute-force protection, session/key rotation policy, egress restrictions, production CORS hosts, HTTPS termination, and incident response.
-- Decide who may create organizations with the deployment service key; it is deliberately a super-admin bootstrap credential.
-- Configure credentials and adapters before enabling S3/GCS private-object ingestion, or an approved inference service before enabling AI-generated predictions.
-- Benchmark and independently validate geospatial metrics and consensus thresholds on representative imagery/CRS data.
+- Select email and identity providers for verified invitations, password recovery, MFA, OIDC/SSO, LDAP, or SCIM; local login throttling does not supply those flows.
+- Choose durable private storage and supply credentials/permissions before S3/GCS adapters, object encryption/lifecycle, multi-instance consistency checks, or shared locking can be delivered.
+- Define retention periods, legal holds, deletion/restore behavior, and export policy before automated retention or destructive deletion. The local backup utility is SQLite-only and unencrypted; production backups need provider-native tooling and tested restore drills.
+- Add malware scanning, invitation abuse controls, session/key rotation, egress restrictions, production CORS, HTTPS termination, quotas, monitoring, and incident response.
+- Choose an approved vision model/provider or self-hosted runtime, provide credentials/compute and data-transfer approval, and evaluate it before automatic image labeling, tracking, segmentation, or video understanding. No inference credentials are configured here.
+- Pixel-level masks, geocoding, and independently validated quality guarantees need the respective editor, geocoder, and representative verified datasets. Current local GIS covers vector spatial joins and bounded raster statistics/change analysis only.
+- Decide who may create organizations with the deployment service key; benchmark and independently validate geospatial metrics and consensus thresholds on representative imagery/CRS data.
 
 No billing provider is configured by this code, and it neither charges users nor claims billing as a peer-product feature.
