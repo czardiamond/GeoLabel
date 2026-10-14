@@ -38,6 +38,7 @@ def test_georeference_repair_is_audited_and_stops_after_task_link(api_client, tm
     with session_factory() as db:
         world_asset = db.query(Asset).filter(Asset.id == worldfile_upload.json()["id"]).one()
         assert world_asset.asset_metadata["georeference"] == "world_file"
+        assert world_asset.asset_metadata["affine_transform"] == [2.0, 0.0, 100.0, 0.0, -2.0, 200.0]
 
     repaired = client.patch(f"/assets/{asset_id}/georeference", headers=owner_headers, json={
         "crs": "EPSG:3857", "bounds": [1000, 2000, 9000, 12000],
@@ -49,6 +50,7 @@ def test_georeference_repair_is_audited_and_stops_after_task_link(api_client, tm
     with session_factory() as db:
         stored = db.query(Asset).filter(Asset.id == asset_id).one()
         assert stored.asset_metadata["georeference"] == "manual_repair"
+        assert stored.asset_metadata["affine_transform"] == [1000.0, 0.0, 1000.0, 0.0, -1250.0, 12000.0]
         assert stored.asset_metadata["georeference_history"][-1]["previous"]["crs"] == "EPSG:4326"
         assert db.query(AuditEvent).filter(AuditEvent.action == "asset.georeference.repaired").count() == 1
 

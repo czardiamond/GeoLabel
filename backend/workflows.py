@@ -12,13 +12,14 @@ import uuid
 import zipfile
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, ValidationError, field_validator
 import pyproj
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
@@ -34,6 +35,7 @@ from backend.asset_storage import (
     storage_root,
 )
 from backend.gis_operations import raster_band_statistics, raster_change_analysis, spatial_join
+from backend.mask_utils import polygonize_png_mask
 from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
@@ -41,6 +43,7 @@ from backend.geo_utils import reproject_feature_collection
 from backend.identity import MemberContext, audit, membership_for, notify, require_member, require_roles
 from backend.models import (
     Annotation,
+    AnnotationDraft,
     AnnotationRevision,
     AuditEvent,
     Asset,
@@ -196,6 +199,11 @@ class PreAnnotationDecision(BaseModel):
     decision: str = Field(pattern="^(accept|reject)$")
 
 
+class AnnotationDraftSave(BaseModel):
+    draft: dict
+    version: int = Field(default=0, ge=0)
+
+
 class GeoreferenceRepair(BaseModel):
     crs: str = Field(min_length=1, max_length=256)
     bounds: list[float] = Field(min_length=4, max_length=4)
@@ -262,8 +270,59 @@ class VideoSegment(BaseModel):
         return value
 
 
+class VideoKeyframe(BaseModel):
+    timestamp_ms: int = Field(ge=0)
+    coordinates: list[Any] = Field(min_length=2, max_length=4096)
+
+
+class VideoTrack(BaseModel):
+    id: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_.:-]+$")
+    category: str = Field(min_length=1, max_length=100)
+    kind: str = Field(pattern="^(bbox|point|polyline)$")
+    keyframes: list[VideoKeyframe] = Field(min_length=1, max_length=500)
+
+    @field_validator("keyframes")
+    @classmethod
+    def validate_keyframes(cls, value, info):
+        kind = info.data.get("kind")
+        frames = sorted(value, key=lambda frame: frame.timestamp_ms)
+        timestamps = [frame.timestamp_ms for frame in frames]
+        if len(timestamps) != len(set(timestamps)):
+            raise ValueError("keyframe timestamps must be unique within a track")
+        topology = None
+        for frame in frames:
+            coordinates = frame.coordinates
+            if kind in {"bbox", "point"}:
+                expected = 4 if kind == "bbox" else 2
+                if len(coordinates) != expected or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in coordinates):
+                    raise ValueError(f"{kind} keyframes require {expected} finite numeric coordinates")
+                numbers = [float(item) for item in coordinates]
+                if kind == "bbox":
+                    x, y, width, height = numbers
+                    if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > 1 or y + height > 1:
+                        raise ValueError("bbox keyframes must fit within normalized video coordinates")
+                elif not all(0 <= item <= 1 for item in numbers):
+                    raise ValueError("point coordinates must be normalized between 0 and 1")
+                current_topology = expected
+            else:
+                if not isinstance(coordinates, list) or len(coordinates) < 2 or any(
+                    not isinstance(point, (list, tuple)) or len(point) != 2
+                    or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                           or not math.isfinite(float(item)) or not 0 <= float(item) <= 1 for item in point)
+                    for point in coordinates
+                ):
+                    raise ValueError("polyline keyframes require at least two normalized [x, y] points")
+                current_topology = len(coordinates)
+            if topology is None:
+                topology = current_topology
+            elif topology != current_topology:
+                raise ValueError("all keyframes in a track must have the same coordinate topology")
+        return frames
+
+
 class VideoSegmentsSubmit(BaseModel):
     segments: list[VideoSegment] = Field(max_length=10000)
+    tracks: list[VideoTrack] = Field(default_factory=list, max_length=200)
 
 
 def _project_for_member(db: Session, project_id: str, member: MemberContext) -> Project:
@@ -402,11 +461,58 @@ def _validate_remote_url(value: str) -> str:
     return host
 
 
-def _check_annotation_geojson(task: Task, geojson: dict) -> dict:
+def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
     if geojson.get("type") != "FeatureCollection" or not isinstance(geojson.get("features"), list):
         raise HTTPException(status_code=422, detail="geojson must be a GeoJSON FeatureCollection with a features array.")
+    source_features = geojson["features"]
+    masks = [
+        (index, feature)
+        for index, feature in enumerate(source_features)
+        if isinstance(feature, dict) and isinstance(feature.get("properties"), dict)
+        and "raster_mask" in feature["properties"]
+    ]
+    if len(masks) > 200:
+        raise HTTPException(status_code=413, detail="An annotation may contain at most 200 pixel-mask strokes.")
+    total_mask_bytes = sum(
+        (len(feature["properties"]["raster_mask"].get("data", "")) * 3 // 4)
+        for _, feature in masks
+        if isinstance(feature["properties"]["raster_mask"], dict)
+        and isinstance(feature["properties"]["raster_mask"].get("data"), str)
+    )
+    if total_mask_bytes > 8_000_000:
+        raise HTTPException(status_code=413, detail="Pixel-mask PNG data exceeds the 8 MB per-submission limit.")
     try:
-        result = reproject_feature_collection(geojson, task.crs)
+        if not masks:
+            result = reproject_feature_collection(geojson, task.crs)
+        else:
+            asset = _task_asset(task, db)
+            if asset.kind != "image" or not asset.width or not asset.height:
+                raise HTTPException(status_code=415, detail="Pixel masks require a georeferenced image asset with known pixel dimensions.")
+            normal_features = [feature for feature in source_features if not (
+                isinstance(feature, dict) and isinstance(feature.get("properties"), dict)
+                and "raster_mask" in feature["properties"]
+            )]
+            normal_collection = {**geojson, "features": normal_features}
+            normalized_normals = reproject_feature_collection(normal_collection, task.crs)
+            normal_iter = iter(normalized_normals["features"])
+            by_index = {index: feature for index, feature in masks}
+            output_features = []
+            metadata = asset.asset_metadata or {}
+            for index, feature in enumerate(source_features):
+                if index not in by_index:
+                    output_features.append(next(normal_iter))
+                    continue
+                properties = feature.get("properties") or {}
+                try:
+                    geometry = polygonize_png_mask(
+                        properties["raster_mask"], expected_width=asset.width, expected_height=asset.height,
+                        affine_transform=metadata.get("affine_transform"), bounds=asset.bounds,
+                        source_crs=asset.crs or task.crs, target_crs=task.crs,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=f"features[{index}].properties.raster_mask: {exc}") from exc
+                output_features.append({**feature, "geometry": geometry})
+            result = {**normalized_normals, "features": output_features}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Submission CRS reprojection failed: {exc}") from exc
     allowed = set(task.taxonomy)
@@ -418,6 +524,41 @@ def _check_annotation_geojson(task: Task, geojson: dict) -> dict:
         if not isinstance(feature.get("geometry"), dict):
             raise HTTPException(status_code=400, detail=f"features[{index}].geometry must be a geometry object.")
     return result
+
+
+def _check_video_segments(task: Task, asset: Asset, segments: list[VideoSegment]) -> list[dict]:
+    categories = set(task.taxonomy)
+    duration_ms = (asset.asset_metadata or {}).get("duration_ms")
+    for index, segment in enumerate(segments):
+        if segment.end_ms <= segment.start_ms:
+            raise HTTPException(status_code=422, detail=f"segments[{index}].end_ms must be after start_ms")
+        if segment.category not in categories:
+            raise HTTPException(status_code=400, detail=f"segments[{index}].category must match the task taxonomy")
+        if duration_ms is not None and segment.end_ms > duration_ms:
+            raise HTTPException(status_code=400, detail=f"segments[{index}].end_ms exceeds the uploaded video's {duration_ms} ms duration")
+    return [segment.model_dump() for segment in segments]
+
+
+def _check_video_tracks(task: Task, asset: Asset, tracks: list[VideoTrack]) -> list[dict]:
+    categories = set(task.taxonomy)
+    duration_ms = (asset.asset_metadata or {}).get("duration_ms")
+    if len(tracks) > 200:
+        raise HTTPException(status_code=422, detail="A video submission may contain at most 200 tracks.")
+    if len({track.id for track in tracks}) != len(tracks):
+        raise HTTPException(status_code=422, detail="Video track IDs must be unique within a submission.")
+    keyframe_count = sum(len(track.keyframes) for track in tracks)
+    if keyframe_count > 5000:
+        raise HTTPException(status_code=422, detail="A video submission may contain at most 5,000 keyframes.")
+    for track_index, track in enumerate(tracks):
+        if track.category not in categories:
+            raise HTTPException(status_code=400, detail=f"tracks[{track_index}].category must match the task taxonomy")
+        for keyframe_index, keyframe in enumerate(track.keyframes):
+            if duration_ms is not None and keyframe.timestamp_ms > duration_ms:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"tracks[{track_index}].keyframes[{keyframe_index}].timestamp_ms exceeds the uploaded video's {duration_ms} ms duration",
+                )
+    return [track.model_dump() for track in tracks]
 
 
 def _quality_scores(db: Session, task: Task) -> dict:
@@ -929,7 +1070,7 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
         raise HTTPException(status_code=409, detail="Another worker currently holds this task reservation.")
     if task.review_status in {"accepted", "rejected"}:
         raise HTTPException(status_code=409, detail="This task has been closed by review.")
-    geojson = _check_annotation_geojson(task, payload.get("geojson") if isinstance(payload, dict) else {})
+    geojson = _check_annotation_geojson(task, payload.get("geojson") if isinstance(payload, dict) else {}, db)
     existing = db.query(Annotation).filter_by(task_id=task.id, annotator_id=member.user_id).first()
     if existing:
         if task.review_status != "rework" and existing.review_status != "rework":
@@ -970,6 +1111,9 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
     if task.review_status == "pending_review":
         _notify_reviewers(db, project.organization_id, member.user_id, task, "Annotation ready for review", f"{task.title or task.id} has all required annotations ready for review.")
     audit(db, project.organization_id, member.user_id, "annotation.submitted", "task", task.id, {"feature_count": len(geojson["features"])})
+    draft = db.query(AnnotationDraft).filter_by(task_id=task.id, user_id=member.user_id).first()
+    if draft:
+        db.delete(draft)
     db.commit()
     db.refresh(task)
     return _task_response(task, db)
@@ -982,6 +1126,108 @@ def list_task_annotations(task_id: str, member: MemberContext = Depends(require_
     rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
     return [{"id": row.id, "annotator_id": row.annotator_id, "geojson": row.geojson, "submitted_at": row.submitted_at,
              "review_status": row.review_status, "review_comment": row.review_comment} for row in rows]
+
+
+@router.get("/work/tasks/{task_id}/annotation-history")
+def list_annotation_history(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+        annotations = db.query(Annotation).filter_by(task_id=task.id, annotator_id=member.user_id).all()
+    else:
+        require_roles(membership, "owner", "admin", "reviewer", "analyst")
+        annotations = db.query(Annotation).filter_by(task_id=task.id).all()
+    history = []
+    for annotation in annotations:
+        revisions = db.query(AnnotationRevision).filter_by(annotation_id=annotation.id).order_by(AnnotationRevision.version.asc()).all()
+        for revision in revisions:
+            history.append({"annotation_id": annotation.id, "annotator_id": annotation.annotator_id,
+                            "version": revision.version, "current": False, "geojson": json.loads(revision.geojson_data),
+                            "review_status": revision.review_status, "submitted_at": revision.submitted_at})
+        current_version = max((revision.version for revision in revisions), default=0) + 1
+        history.append({"annotation_id": annotation.id, "annotator_id": annotation.annotator_id,
+                        "version": current_version, "current": True, "geojson": annotation.geojson,
+                        "review_status": annotation.review_status, "review_comment": annotation.review_comment,
+                        "submitted_at": annotation.submitted_at})
+    history.sort(key=lambda row: (row["annotator_id"], row["version"]))
+    return {"task_id": task.id, "history": history,
+            "history_scope": "submitted versions only; transient undo and unsent drafts are separate"}
+
+
+@router.get("/work/tasks/{task_id}/draft")
+def get_task_draft(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    _require_task_assignment(task, membership, member, db)
+    require_roles(membership, "owner", "admin", "annotator")
+    row = db.query(AnnotationDraft).filter_by(task_id=task.id, user_id=member.user_id).first()
+    if not row:
+        return {"available": False, "version": 0}
+    return {"available": True, "draft": json.loads(row.draft_json), "version": row.version,
+            "updated_at": row.updated_at}
+
+
+@router.put("/work/tasks/{task_id}/draft")
+def save_task_draft(task_id: str, payload: AnnotationDraftSave, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    task = _locked_task(db, task_id)
+    _require_task_assignment(task, membership, member, db)
+    require_roles(membership, "owner", "admin", "annotator")
+    if task.review_status in {"accepted", "rejected"}:
+        raise HTTPException(status_code=409, detail="This task has been closed by review.")
+
+    if task.task_type == "video":
+        if payload.draft.get("type") != "GeoLabelVideoDraft" or not isinstance(payload.draft.get("segments"), list):
+            raise HTTPException(status_code=422, detail="Video drafts must contain type GeoLabelVideoDraft and a segments array.")
+        asset = _task_asset(task, db)
+        try:
+            video_payload = VideoSegmentsSubmit.model_validate({
+                "segments": payload.draft["segments"], "tracks": payload.draft.get("tracks", [])
+            })
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
+        normalized = {
+            "type": "GeoLabelVideoDraft",
+            "segments": _check_video_segments(task, asset, video_payload.segments),
+            "tracks": _check_video_tracks(task, asset, video_payload.tracks),
+        }
+        existing_submission = db.query(VideoSegmentSubmission).filter_by(task_id=task.id, user_id=member.user_id).order_by(VideoSegmentSubmission.version.desc()).first()
+        if existing_submission and task.review_status != "rework" and existing_submission.review_status != "rework":
+            raise HTTPException(status_code=409, detail="This account has already submitted video segments; drafts require reviewer rework.")
+    else:
+        normalized = _check_annotation_geojson(task, payload.draft, db)
+        existing_annotation = db.query(Annotation).filter_by(task_id=task.id, annotator_id=member.user_id).first()
+        if existing_annotation and task.review_status != "rework" and existing_annotation.review_status != "rework":
+            raise HTTPException(status_code=409, detail="This account has already submitted an annotation; drafts require reviewer rework.")
+
+    encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > max(1, settings.MAX_ANNOTATION_DRAFT_BYTES):
+        raise HTTPException(status_code=413, detail="Draft exceeds the configured MAX_ANNOTATION_DRAFT_BYTES limit.")
+    row = db.query(AnnotationDraft).filter_by(task_id=task.id, user_id=member.user_id).with_for_update().first()
+    if row:
+        if payload.version != row.version:
+            raise HTTPException(status_code=409, detail=f"Draft version conflict; the current server version is {row.version}. Reload or recover it before saving.")
+        row.draft_json = encoded
+        row.version += 1
+        row.updated_at = utcnow_naive()
+    else:
+        if payload.version != 0:
+            raise HTTPException(status_code=409, detail="No server draft exists at the supplied version. Reload the task before saving.")
+        row = AnnotationDraft(task_id=task.id, user_id=member.user_id, draft_json=encoded, version=1)
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"available": True, "version": row.version, "updated_at": row.updated_at}
+
+
+@router.delete("/work/tasks/{task_id}/draft", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task_draft(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    _require_task_assignment(task, membership, member, db)
+    require_roles(membership, "owner", "admin", "annotator")
+    row = db.query(AnnotationDraft).filter_by(task_id=task.id, user_id=member.user_id).first()
+    if row:
+        db.delete(row)
+        db.commit()
 
 
 @router.post("/work/tasks/{task_id}/review")
@@ -1072,7 +1318,7 @@ def set_gold_standard(task_id: str, payload: GoldStandardInput, member: MemberCo
     require_roles(membership, "owner", "admin", "reviewer")
     if task.task_type == "video":
         raise HTTPException(status_code=415, detail="Gold-standard time segments are not supported for video tasks in this release.")
-    geojson = _check_annotation_geojson(task, payload.geojson)
+    geojson = _check_annotation_geojson(task, payload.geojson, db)
     item = db.query(GoldStandard).filter_by(task_id=task.id).first()
     if not item:
         item = GoldStandard(task_id=task.id, created_by_user_id=member.user_id)
@@ -1120,7 +1366,7 @@ def create_preannotation(task_id: str, payload: PreAnnotationInput, member: Memb
     require_roles(membership, "owner", "admin", "reviewer")
     if task.task_type == "video":
         raise HTTPException(status_code=415, detail="Vector pre-annotations use the geospatial annotation endpoint; video inference is provider-dependent.")
-    geojson = _check_annotation_geojson(task, payload.geojson)
+    geojson = _check_annotation_geojson(task, payload.geojson, db)
     item = PreAnnotation(task_id=task.id, source=payload.source.strip(), model_version=payload.model_version,
                          geojson_data=json.dumps(geojson), status="pending", created_by_user_id=member.user_id)
     db.add(item)
@@ -1172,21 +1418,15 @@ def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: Me
         raise HTTPException(status_code=415, detail="Temporal segments can only be submitted for an uploaded video task.")
     if task.review_status in {"accepted", "rejected"}:
         raise HTTPException(status_code=409, detail="This video task has been closed by review.")
-    categories = set(task.taxonomy)
-    for index, segment in enumerate(payload.segments):
-        if segment.end_ms <= segment.start_ms:
-            raise HTTPException(status_code=422, detail=f"segments[{index}].end_ms must be after start_ms")
-        if segment.category not in categories:
-            raise HTTPException(status_code=400, detail=f"segments[{index}].category must match the task taxonomy")
-        duration_ms = (asset.asset_metadata or {}).get("duration_ms")
-        if duration_ms is not None and segment.end_ms > duration_ms:
-            raise HTTPException(status_code=400, detail=f"segments[{index}].end_ms exceeds the uploaded video's {duration_ms} ms duration")
+    checked_segments = _check_video_segments(task, asset, payload.segments)
+    checked_tracks = _check_video_tracks(task, asset, payload.tracks)
     previous = db.query(VideoSegmentSubmission).filter_by(task_id=task.id, user_id=member.user_id).order_by(VideoSegmentSubmission.version.desc()).first()
     if previous and task.review_status != "rework" and previous.review_status != "rework":
         raise HTTPException(status_code=409, detail="This account has already submitted video segments; edits require reviewer rework.")
     version = (previous.version + 1) if previous else 1
     submission = VideoSegmentSubmission(task_id=task.id, user_id=member.user_id, version=version,
-                                        segments_json=json.dumps([item.model_dump() for item in payload.segments]), review_status="pending")
+                                        segments_json=json.dumps(checked_segments), tracks_json=json.dumps(checked_tracks),
+                                        review_status="pending")
     db.add(submission)
     db.flush()
     task.review_status = "not_started"
@@ -1208,9 +1448,13 @@ def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: Me
     if task.review_status == "pending_review":
         _notify_reviewers(db, project.organization_id, member.user_id, task, "Video segments ready for review", f"{task.title or task.id} has all required video submissions ready for review.")
     audit(db, project.organization_id, member.user_id, "video_segments.submitted", "task", task.id, {"segment_count": len(payload.segments), "version": version})
+    draft = db.query(AnnotationDraft).filter_by(task_id=task.id, user_id=member.user_id).first()
+    if draft:
+        db.delete(draft)
     db.commit()
     db.refresh(submission)
     return {"id": submission.id, "task_id": task.id, "version": submission.version, "segments": submission.segments,
+            "tracks": submission.tracks,
             "review_status": submission.review_status, "submitted_at": submission.submitted_at}
 
 
@@ -1224,8 +1468,26 @@ def list_video_segments(task_id: str, member: MemberContext = Depends(require_me
     latest = {}
     for item in submissions:
         latest.setdefault(item.user_id, item)
-    return [{"user_id": item.user_id, "version": item.version, "segments": item.segments,
+    return [{"user_id": item.user_id, "version": item.version, "segments": item.segments, "tracks": item.tracks,
              "review_status": item.review_status, "submitted_at": item.submitted_at} for item in latest.values()]
+
+
+@router.get("/work/tasks/{task_id}/video-segments/history")
+def list_video_segment_history(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+        rows = db.query(VideoSegmentSubmission).filter_by(task_id=task.id, user_id=member.user_id).order_by(
+            VideoSegmentSubmission.user_id.asc(), VideoSegmentSubmission.version.asc()
+        ).all()
+    else:
+        require_roles(membership, "owner", "admin", "reviewer", "analyst")
+        rows = db.query(VideoSegmentSubmission).filter_by(task_id=task.id).order_by(
+            VideoSegmentSubmission.user_id.asc(), VideoSegmentSubmission.version.asc()
+        ).all()
+    return [{"user_id": item.user_id, "version": item.version, "segments": item.segments, "tracks": item.tracks,
+             "review_status": item.review_status, "submitted_at": item.submitted_at,
+             "reviewed_at": item.reviewed_at} for item in rows]
 
 
 @router.get("/annotator/tasks/{task_id}/asset/content")
@@ -1274,8 +1536,9 @@ def repair_asset_georeference(asset_id: str, payload: GeoreferenceRepair, member
         raise HTTPException(status_code=415, detail="Manual bounds repair is limited to ordinary images; embedded raster affine transforms require a dedicated raster workflow.")
     if db.query(Task.id).filter(Task.asset_id == asset.id).first():
         raise HTTPException(status_code=409, detail="Georeference cannot be changed after this asset is linked to a task; create a corrected asset to preserve existing annotation semantics.")
-    old = {"crs": asset.crs, "bounds": asset.bounds}
     metadata = asset.asset_metadata or {}
+    old = {"crs": asset.crs, "bounds": asset.bounds,
+           "affine_transform": metadata.get("affine_transform")}
     history = list(metadata.get("georeference_history", []))
     now = utcnow_naive()
     history.append({"source": "manual_repair", "actor_user_id": member.user_id,
@@ -1283,6 +1546,11 @@ def repair_asset_georeference(asset_id: str, payload: GeoreferenceRepair, member
                     "crs": payload.crs, "bounds": payload.bounds, "updated_at": now.isoformat()})
     metadata["georeference_history"] = history[-50:]
     metadata["georeference"] = "manual_repair"
+    xmin, ymin, xmax, ymax = payload.bounds
+    metadata["affine_transform"] = [
+        (xmax - xmin) / asset.width, 0.0, xmin,
+        0.0, -(ymax - ymin) / asset.height, ymax,
+    ]
     asset.crs = payload.crs
     asset.bounds_json = json.dumps(payload.bounds, separators=(",", ":"))
     asset.metadata_json = json.dumps(metadata, separators=(",", ":"))
@@ -1485,3 +1753,25 @@ def export_organization(organization_id: str, member: MemberContext = Depends(re
         export_path.unlink(missing_ok=True)
         db.rollback()
         raise
+
+
+@router.get("/work/tasks/{task_id}/inference/status")
+def task_inference_status(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+    else:
+        require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    return {
+        "available": False,
+        "provider_configured": False,
+        "model_configured": False,
+        "external_data_transfer": False,
+        "human_review_required": True,
+        "reason_code": "provider_and_approval_not_configured",
+        "message": (
+            "AI suggestions are unavailable: GeoLabel has no approved inference provider or model configured. "
+            "No asset imagery is sent to an external service. Provider, data-transfer, and spend approval are "
+            "required before provider-backed suggestions can be enabled; any suggestions must remain reviewable."
+        ),
+    }

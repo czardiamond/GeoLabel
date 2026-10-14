@@ -48,18 +48,52 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
         "segments": [{"start_ms": 0, "end_ms": asset["metadata"]["duration_ms"] + 1000, "category": "vehicle", "notes": ""}],
     })
     assert too_long.status_code == 400
+    too_long_track = client.post(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers, json={
+        "segments": [], "tracks": [{"id": "car-1", "category": "vehicle", "kind": "bbox", "keyframes": [
+            {"timestamp_ms": asset["metadata"]["duration_ms"] + 1, "coordinates": [0.1, 0.1, 0.2, 0.2]},
+        ]}],
+    })
+    assert too_long_track.status_code == 400
+    invalid_track = client.post(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers, json={
+        "segments": [], "tracks": [{"id": "bad-box", "category": "vehicle", "kind": "bbox", "keyframes": [
+            {"timestamp_ms": 100, "coordinates": [0.9, 0.9, 0.2, 0.2]},
+        ]}],
+    })
+    assert invalid_track.status_code == 422
+
+    video_draft = {"type": "GeoLabelVideoDraft", "segments": [
+        {"start_ms": 100, "end_ms": 500, "category": "vehicle", "notes": "recoverable"},
+    ], "tracks": [{"id": "vehicle-1", "category": "vehicle", "kind": "bbox", "keyframes": [
+        {"timestamp_ms": 100, "coordinates": [0.1, 0.1, 0.2, 0.2]},
+        {"timestamp_ms": 600, "coordinates": [0.3, 0.1, 0.2, 0.2]},
+    ]}]}
+    saved_draft = client.put(f"/work/tasks/{task['id']}/draft", headers=owner_headers,
+                             json={"draft": video_draft, "version": 0})
+    assert saved_draft.status_code == 200, saved_draft.text
+    assert saved_draft.json()["version"] == 1
+    recovered_draft = client.get(f"/work/tasks/{task['id']}/draft", headers=owner_headers)
+    assert recovered_draft.json()["draft"]["segments"][0]["notes"] == "recoverable"
+    assert recovered_draft.json()["draft"]["tracks"][0]["keyframes"][1]["coordinates"][0] == 0.3
 
     submitted = client.post(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers, json={
         "segments": [{"start_ms": 100, "end_ms": min(700, asset["metadata"]["duration_ms"]), "category": "vehicle", "notes": "moving through frame"}],
+        "tracks": video_draft["tracks"],
     })
     assert submitted.status_code == 201, submitted.text
     assert submitted.json()["segments"][0]["category"] == "vehicle"
+    assert client.get(f"/work/tasks/{task['id']}/draft", headers=owner_headers).json() == {"available": False, "version": 0}
     refreshed = client.get(f"/work/tasks/{task['id']}", headers=owner_headers)
     assert refreshed.json()["status"] == "completed"
     assert refreshed.json()["review_status"] == "pending_review"
     stored = client.get(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers)
     assert len(stored.json()) == 1
     assert stored.json()[0]["segments"][0]["start_ms"] == 100
+    assert stored.json()[0]["tracks"][0]["keyframes"][1]["timestamp_ms"] == 600
+    history = client.get(f"/work/tasks/{task['id']}/video-segments/history", headers=owner_headers)
+    assert history.status_code == 200
+    assert len(history.json()) == 1
+    assert history.json()[0]["version"] == 1
+    assert history.json()[0]["tracks"][0]["id"] == "vehicle-1"
     reviewed = client.post(f"/work/tasks/{task['id']}/review", headers=owner_headers,
                            json={"decision": "accept", "comment": "Temporal labels verified."})
     assert reviewed.status_code == 200

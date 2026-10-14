@@ -40,7 +40,7 @@ Passwords are hashed with PBKDF2-HMAC-SHA-256 and random salts. Session tokens a
 - Organization-scoped projects and datasets; uploaded assets are organized in datasets.
 - Private local image/raster uploads, GeoTIFF metadata extraction (CRS, bounds, dimensions), and server-generated PNG previews. GeoTIFF content is read with Rasterio; an image upload is decoded and previewed with Pillow.
 - PNG/JPEG/WebP/BMP uploads require a valid CRS and either explicit `[xmin, ymin, xmax, ymax]` bounds or a standard six-line world file (A,D,B,E,C,F). Pixel-center affine coefficients are converted to an axis-aligned footprint, including rotated transforms. **GeoLabel does not infer coordinates from image pixels.** GeoTIFF embedded georeferencing takes precedence; contradictory metadata is rejected. Ordinary-image CRS/bounds can be repaired before task linkage with required rationale and provenance; embedded GeoTIFF transforms are not overwritten.
-- MP4/WebM/MOV assets can be uploaded and streamed privately for browser-native playback. Temporal segments are stored as millisecond ranges, categories, and notes. Actual video playback depends on the end user's browser and codec support.
+- MP4/WebM/MOV assets can be uploaded and streamed privately for browser-native playback. Temporal segments are stored as millisecond ranges, categories, and notes. Contributors can also author normalized bounding-box, point, and polyline tracks at video timestamps; matching keyframes interpolate linearly between authored frames and are stored with each immutable video revision. Actual video playback depends on the end user's browser and codec support.
 - Remote HTTPS import is opt-in by exact-host allowlist (`IMAGERY_ALLOWED_HOSTS`). Imports reject embedded credentials, non-public DNS results, redirects, and files over the configured upload limit. Allowlisted remote downloads are copied into local private storage; the source URL is not retained in the asset record.
 - Task creation from one asset or a dataset batch; priority ordering, named assignment, multiple explicit worker assignments, time-bounded reservations, and separate annotate/review queues.
 - Independently assigned workers submit separately; unassigned tasks can also accept independent submissions. Reservations are released on submission, review is held until the target count is met, and reviewer notifications are sent only when all required workers are ready.
@@ -52,8 +52,9 @@ Uploads stream to disk and are limited by `MAX_ASSET_UPLOAD_MB` (default 512 MB)
 
 ### Browser annotation and team review
 
-- Authenticated in-browser image/raster viewing supports boxes, polygons, polylines, points, keypoints, multipart geometry display, and draggable vertices. Closed rings and extra coordinate dimensions are preserved. The brush remains a vector outline exported as GeoJSON; **pixel-level masks and rasterized brush editing are not implemented**.
-- Temporal video-segment annotation for uploaded video assets, with playhead-derived time ranges, category and notes; reviewers can see each submitter's ranges and seek playback to inspect them.
+- Authenticated in-browser image/raster viewing supports boxes, polygons, polylines, points, keypoints, multipart geometry display, draggable vertices, and source-pixel PNG masks. Masks are size-bounded and polygonized server-side using the asset pixel affine, then reprojected into the task CRS while remaining embedded in the submitted GeoJSON feature for exact pixel recovery. Browser painting is limited to 8 million source pixels per asset and 2 MB per stroke; a submission is limited to 200 strokes and 8 MB decoded mask data.
+- Temporal video-segment annotation for uploaded video assets, with playhead-derived time ranges, category and notes. Contributors can author time-indexed bounding-box, point, and polyline tracks, add/update keyframes, seek between authored keyframes, and inspect linear interpolation between them. Reviewers can see each submitter's segments and tracks, seek playback, and inspect immutable versions.
+- Contributor tools include bounded undo/redo (100 snapshots) for image features and video tracks, B/P/L/O/K/M drawing shortcuts, Escape cancellation, versioned server autosave and draft recovery, and read-only submitted revision timelines with copy-to-draft. Drafts and accepted submissions preserve existing task CRS and GeoJSON behavior.
 - Annotation submission remains GeoJSON-first and preserves the task CRS and existing reprojection behavior.
 - Reviewer queue with explicit accept/reject/rework decisions. A rework resubmission replaces the current annotation while a prior version is retained in `annotation_revisions`.
 - Task discussion comments and issue records, in-app notifications, and notification read state.
@@ -63,7 +64,7 @@ Uploads stream to disk and are limited by `MAX_ASSET_UPLOAD_MB` (default 512 MB)
 
 The scoring implementation is **heuristic**, using the existing geospatial feature matcher at its default IoU threshold. Scorer version/configuration are persisted and category-tie behavior is deterministic. Gold-set scores depend on the correctness and representativeness of supplied gold data; they are not independently validated quality guarantees or a compliance attestation. Agreement/consensus outputs remain heuristic.
 
-The pre-annotation API only stores and reviews provider-supplied candidate GeoJSON. **It does not run AI detection, tracking, or segmentation models.** No GeoLabel inference adapter/model selection, data-transfer approval, inference runtime, or accuracy evaluation plan is configured in this repository task; general-purpose model credentials elsewhere in an environment are not wired to these routes. Do not tell annotators that imported suggestions were generated by GeoLabel itself.
+The pre-annotation API only stores and reviews provider-supplied candidate GeoJSON. **GeoLabel does not run AI detection, object tracking, video understanding, or segmentation models.** The authenticated `/work/tasks/{id}/inference/status` route and contributor UI explicitly report that suggestions are unavailable: there is no approved inference provider/model, data-transfer authorization, inference runtime, or accuracy evaluation plan. The status check never calls a model or transfers imagery. General-purpose model credentials elsewhere in an environment are not wired to these routes. Do not tell annotators that imported suggestions were generated by GeoLabel itself.
 
 ## Roles
 
@@ -143,7 +144,11 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `POST` | `/work/tasks/{id}/assign` | Owner/admin/reviewer | Assign or reassign one worker |
 | `POST` | `/work/tasks/{id}/assignments` | Owner/admin/reviewer | Add independent task workers |
 | `POST` | `/work/tasks/{id}/annotations` | Assigned organization user | Submit geospatial annotation |
-| `POST` | `/work/tasks/{id}/video-segments` | Assigned organization user | Submit temporal video segments |
+| `GET` / `PUT` / `DELETE` | `/work/tasks/{id}/draft` | Assigned organization user | Recover, autosave/version, or discard an unsent contributor draft |
+| `GET` | `/work/tasks/{id}/annotation-history` | Task member / reviewer | Read immutable submitted image and video versions |
+| `POST` | `/work/tasks/{id}/video-segments` | Assigned organization user | Submit temporal segments and authored keyframe tracks |
+| `GET` | `/work/tasks/{id}/video-segments` and `/history` | Assigned contributor / reviewer | Read latest tracks and immutable video versions |
+| `GET` | `/work/tasks/{id}/inference/status` | Assigned organization user | Report provider/model availability; never invokes inference |
 | `POST` | `/work/tasks/{id}/review` | Reviewer/admin | Accept, reject or request rework |
 | `POST` | `/work/tasks/{id}/comments` | Task organization member | Add comment or issue |
 | `PUT` | `/work/tasks/{id}/gold-standard` | Reviewer/admin | Save independent reference data |
@@ -163,7 +168,7 @@ Both user-session and annotator-key asset routes are protected; browser clients 
 
 ## Backward-compatible migrations
 
-Apply `alembic upgrade head` before starting an upgraded installation. `0002_workspaces_assets_review` and `0003_assignments_scoring_auth` are additive: they preserve existing tasks and annotations while adding organization workflows, explicit assignments, scorer provenance, and DB-backed login throttle records. Legacy task project/dataset/asset columns remain empty; old flows continue to use their original fields.
+Apply `alembic upgrade head` before starting an upgraded installation. `0002_workspaces_assets_review` and `0003_assignments_scoring_auth` are additive: they preserve existing tasks and annotations while adding organization workflows, explicit assignments, scorer provenance, and DB-backed login throttle records. `0004_annotation_drafts` adds recoverable unsent work; `0005_video_keyframe_tracks` adds an empty track array to old video revisions without changing segment history. Legacy task project/dataset/asset columns remain empty; old flows continue to use their original fields.
 
 Automatic downgrade is deliberately disabled because deleting new account/media/review tables or columns could discard user data. Back up the database and asset directory before production migration. Test database restore and migration behavior in a copy of real data first.
 
@@ -178,7 +183,9 @@ npm run lint
 npm run build
 ```
 
-The tests exercise legacy compatibility and migrations, organization isolation, GeoTIFF/world-file ingestion and repair, private media and multi-worker assignment, independent submissions, scorer provenance, login throttling, GIS joins/statistics/change, export secret exclusion, local readiness, SQLite/media backup integrity, review/rework, video timing, and notifications.
+The tests exercise legacy compatibility and migrations, organization isolation, GeoTIFF/world-file ingestion and repair, source-pixel masks and CRS polygonization, private media and multi-worker assignment, independent submissions, scorer provenance, login throttling, GIS joins/statistics/change, export secret exclusion, local readiness, SQLite/media backup integrity, review/rework, versioned draft recovery, undo/redo and interpolation utilities, video keyframe validation/duration/history, inference-disabled status, and notifications.
+
+The official-documentation behavior comparison is recorded in [`docs/competitor-workflow-comparison.md`](docs/competitor-workflow-comparison.md). GeoLabel implements comparable contributor workflow patterns, not the competitors' proprietary code or branding; provider/model-dependent functions remain explicitly unavailable until configured and authorized.
 
 ## Operational boundaries before production
 

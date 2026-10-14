@@ -287,6 +287,19 @@ class AnnotationRevision(Base):
     created_at = Column(DateTime, nullable=False, default=utcnow_naive)
 
 
+class AnnotationDraft(Base):
+    """Recoverable, private in-progress annotation state for one task worker."""
+    __tablename__ = "annotation_drafts"
+    __table_args__ = (UniqueConstraint("task_id", "user_id", name="uq_annotation_draft_task_user"),)
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("user_accounts.id"), nullable=False, index=True)
+    draft_json = Column(Text, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime, nullable=False, default=utcnow_naive)
+
+
 class TaskComment(Base):
     __tablename__ = "task_comments"
 
@@ -356,6 +369,7 @@ class VideoSegmentSubmission(Base):
     user_id = Column(String, ForeignKey("user_accounts.id"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     segments_json = Column(Text, nullable=False)
+    tracks_json = Column(Text, nullable=False, default="[]", server_default="[]")
     review_status = Column(String(24), nullable=False, default="pending")
     reviewed_by_user_id = Column(String, ForeignKey("user_accounts.id"), nullable=True)
     submitted_at = Column(DateTime, nullable=False, default=utcnow_naive)
@@ -371,6 +385,17 @@ class VideoSegmentSubmission(Base):
     @segments.setter
     def segments(self, value):
         self.segments_json = json.dumps(value)
+
+    @property
+    def tracks(self):
+        try:
+            return json.loads(self.tracks_json)
+        except (TypeError, json.JSONDecodeError):
+            return []
+
+    @tracks.setter
+    def tracks(self, value):
+        self.tracks_json = json.dumps(value)
 
 
 class QuoteRequest(Base):

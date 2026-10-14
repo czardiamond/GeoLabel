@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     ASSET_STORAGE_DIR: str = "./geolabel-assets"
     MAX_ASSET_UPLOAD_MB: int = 512
     MAX_ORGANIZATION_EXPORT_MB: int = 2048
+    MAX_ANNOTATION_DRAFT_BYTES: int = 5_000_000
     USER_SESSION_HOURS: int = 12
     LOGIN_RATE_LIMIT_ATTEMPTS: int = 10
     LOGIN_RATE_LIMIT_WINDOW_SECONDS: int = 900

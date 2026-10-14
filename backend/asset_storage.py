@@ -91,7 +91,7 @@ def _is_tiff(path: Path, content_type: str, filename: str) -> bool:
     return content_type in {"image/tiff", "image/geotiff"} or Path(filename).suffix.lower() in {".tif", ".tiff", ".cog"}
 
 
-def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, list[float] | None]:
+def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, list[float] | None, list[float]]:
     import numpy as np
     import rasterio
     from rasterio.enums import Resampling
@@ -128,7 +128,8 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
         bounds = [float(dataset.bounds.left), float(dataset.bounds.bottom), float(dataset.bounds.right), float(dataset.bounds.top)]
         if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
             bounds = None
-        return width, height, crs, bounds
+        transform = [float(value) for value in dataset.transform[:6]]
+        return width, height, crs, bounds, transform
 
 
 def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value: str | None,
@@ -176,7 +177,7 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
         if world_file_value:
             raise ValueError("GeoTIFF uploads use their embedded affine transform; sidecar world files are supported only for ordinary images")
         try:
-            width, height, raster_crs, raster_bounds = _raster_preview(path, preview_path)
+            width, height, raster_crs, raster_bounds, affine_transform = _raster_preview(path, preview_path)
         except Exception as exc:
             preview_path.unlink(missing_ok=True)
             raise ValueError(f"The GeoTIFF could not be decoded: {exc}") from exc
@@ -193,7 +194,7 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
             raise ValueError("The supplied bounds conflict with the GeoTIFF's embedded bounds")
         return {"kind": "image", "content_type": "image/tiff", "width": width, "height": height,
                 "crs": final_crs, "bounds": final_bounds, "preview_path": preview_path,
-                "metadata": {"driver": "GeoTIFF", "bands": "raster"}}
+                "metadata": {"driver": "GeoTIFF", "bands": "raster", "affine_transform": affine_transform}}
 
     try:
         with Image.open(path) as opened:
@@ -219,6 +220,12 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
     metadata = {"georeference": "world_file" if world_file_value else "explicit_bounds"}
     if world_coefficients:
         metadata["world_file_coefficients"] = world_coefficients
+        a, d, b, e, c, f = world_coefficients
+        metadata["affine_transform"] = [a, b, c - 0.5 * (a + b), d, e, f - 0.5 * (d + e)]
+    else:
+        xmin, ymin, xmax, ymax = final_bounds
+        metadata["affine_transform"] = [(xmax - xmin) / width, 0.0, xmin,
+                                        0.0, -(ymax - ymin) / height, ymax]
     return {"kind": "image", "content_type": declared, "width": width, "height": height,
             "crs": supplied_crs, "bounds": final_bounds, "preview_path": preview_path,
             "metadata": metadata}

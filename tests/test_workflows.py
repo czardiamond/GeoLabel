@@ -227,6 +227,12 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     )
     assert accepted.status_code == 200
     assert accepted.json()["review_status"] == "accepted"
+    history = client.get(f"/work/tasks/{task['id']}/annotation-history", headers=owner_headers)
+    assert history.status_code == 200
+    assert [(row["version"], row["current"]) for row in history.json()["history"]] == [(1, False), (2, True)]
+    assert history.json()["history"][0]["geojson"]["features"][0]["geometry"] != history.json()["history"][1]["geojson"]["features"][0]["geometry"]
+    worker_history = client.get(f"/work/tasks/{task['id']}/annotation-history", headers=worker_headers)
+    assert len(worker_history.json()["history"]) == 2
     worker_notifications = client.get("/auth/notifications?unread_only=true", headers=worker_headers)
     assert worker_notifications.status_code == 200
     assert any("accepted" in item["title"].lower() or "rework" in item["title"].lower() for item in worker_notifications.json())
