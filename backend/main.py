@@ -1,156 +1,228 @@
-"""
-GeoLabel Task Management FastAPI Server
-Supports SQLite / Postgres, API Key Auth, Human-in-the-Loop Annotation Tasks, and IAA Scoring
-"""
+"""GeoLabel Task Management FastAPI Server."""
 
-from typing import Optional, List
-from datetime import datetime
-import json
+import logging
+import secrets
+from typing import Optional
+from urllib.parse import urlsplit
+
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Security, status, BackgroundTasks
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.auth import generate_annotator_credentials, get_current_annotator
 from backend.config import settings
-from backend.database import Base, engine, get_db
-from backend.models import Task, Annotation, AnnotatorApiKey
+from backend.database import get_db
+from backend.geo_utils import reproject_feature_collection
+from backend.models import Annotation, AnnotatorApiKey, QuoteRequest, Task, utcnow_naive
 from backend.schemas import (
+    AnnotatorTaskResponse,
+    AnnotatorRegisterRequest,
+    AnnotatorRegisterResponse,
+    AnnotationSubmit,
+    QuoteCreate,
+    QuoteResponse,
     TaskCreate,
     TaskResponse,
     TaskResultsResponse,
-    AnnotationSubmit,
     WebhookRegister,
-    AnnotatorRegisterResponse
 )
-from backend.scoring import compute_task_iaa, build_consensus_geojson
-from backend.geo_utils import get_feature_collection_crs, reproject_feature_collection
-from backend.auth import generate_annotator_credentials, get_current_annotator
+from backend.scoring import build_consensus_geojson, compute_task_iaa
 
-# Initialize database tables
-Base.metadata.create_all(bind=engine)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="Backend REST API for GeoLabel Specialist Geospatial Annotation Platform"
+    description="API for geospatial annotation task intake, annotation submission, and agreement scoring.",
 )
-
-# CORS Middleware setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Annotator-API-Key"],
 )
 
 security = HTTPBearer(auto_error=False)
 
+
+def webhook_host_allowed(webhook_url: str) -> bool:
+    hostname = urlsplit(webhook_url).hostname
+    return bool(hostname and hostname.lower().rstrip(".") in settings.webhook_allowed_host_list)
+
+
+def require_allowed_webhook(webhook_url: Optional[str]) -> None:
+    if webhook_url and not webhook_host_allowed(webhook_url):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Webhooks are disabled for this host. Configure its exact hostname in WEBHOOK_ALLOWED_HOSTS.",
+        )
+
+
 def verify_api_key(
-    credentials: Optional[HTTPAuthorizationCredentials] = Security(security)
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
 ):
-    """
-    Validates Bearer token or fallback secret key for admin/client endpoints.
-    """
-    if not settings.API_KEY:
-        return True  # If no API key set, allow requests (dev mode)
+    """Require the configured service key; never accept an unset or sample key."""
+    configured_key = settings.API_KEY
+    if not configured_key or len(configured_key) < 32:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="API authentication is not configured safely. Set GEOLABEL_API_KEY to a random secret of at least 32 characters.",
+        )
 
-    provided_key = None
-    if credentials:
-        provided_key = credentials.credentials
-
-    if not provided_key or provided_key != settings.API_KEY:
+    provided_key = credentials.credentials if credentials else None
+    if not provided_key or not secrets.compare_digest(provided_key, configured_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key. Provide Bearer token in Authorization header.",
+            detail="Invalid or missing API key. Provide a Bearer token in the Authorization header.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return True
 
 
 async def trigger_webhook_callback(webhook_url: str, task_data: dict):
-    """
-    Dispatches HTTP POST notification to client webhook URL upon task completion.
-    """
+    """Send a best-effort completion event. Delivery is not retried by this service."""
     if not webhook_url:
         return
+    if not webhook_host_allowed(webhook_url):
+        logger.error("Webhook host is not allowlisted for task %s", task_data["id"])
+        return
 
+    payload = {
+        "event": "task.completed",
+        "task_id": task_data["id"],
+        "status": task_data["status"],
+        "iaa_score": task_data["iaa_score"],
+        "iaa_type": task_data["iaa_type"],
+        "completed_at": str(task_data["completed_at"]),
+    }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            payload = {
-                "event": "task.completed",
-                "task_id": task_data["id"],
-                "status": task_data["status"],
-                "iaa_score": task_data["iaa_score"],
-                "iaa_type": task_data["iaa_type"],
-                "completed_at": str(task_data["completed_at"]),
-            }
-            await client.post(webhook_url, json=payload)
-    except Exception as e:
-        print(f"[Webhook Error] Failed to send webhook to {webhook_url}: {str(e)}")
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+            response = await client.post(webhook_url, json=payload)
+            response.raise_for_status()
+    except Exception:
+        logger.exception("Webhook delivery failed for task %s", task_data["id"])
 
 
 @app.get("/health")
 def health_check():
-    """Public health check endpoint for Railway/Render probes."""
+    """Liveness probe."""
     return {"status": "ok", "service": "geolabel-backend", "version": settings.VERSION}
+
+
+@app.get("/health/ready")
+def readiness_check(db: Session = Depends(get_db)):
+    """Readiness probe that checks database connectivity."""
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as exc:
+        logger.exception("Database readiness check failed")
+        raise HTTPException(status_code=503, detail="Database is not ready") from exc
+    return {"status": "ready", "service": "geolabel-backend", "version": settings.VERSION}
 
 
 @app.get("/")
 def root_info():
-    """API Info."""
-    return {
-        "message": "GeoLabel Geospatial Annotation API",
-        "docs": "/docs",
-        "health": "/health"
-    }
+    return {"message": "GeoLabel Geospatial Annotation API", "docs": "/docs", "health": "/health"}
 
 
-@app.post("/annotators/register", response_model=AnnotatorRegisterResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/annotators/register",
+    response_model=AnnotatorRegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def register_annotator(
+    payload: AnnotatorRegisterRequest,
     db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Register a new specialist annotator, generate a secret API key, and return the key once.
-    Stores only the SHA-256 hash of the API key in the database.
-    """
+    """Create an annotator credential; the raw key is returned only once."""
+    task = db.query(Task).filter(Task.id == payload.task_id).with_for_update().first()
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Annotation task '{payload.task_id}' not found.")
+    assigned_count = db.query(AnnotatorApiKey).filter(AnnotatorApiKey.task_id == task.id).count()
+    if assigned_count >= task.target_annotator_count:
+        raise HTTPException(status_code=409, detail="This task already has its target number of annotator credentials.")
+
     annotator_id, raw_api_key, api_key_hash = generate_annotator_credentials()
     key_record = AnnotatorApiKey(
         annotator_id=annotator_id,
+        task_id=task.id,
         api_key_hash=api_key_hash,
-        created_at=datetime.utcnow()
+        created_at=utcnow_naive(),
     )
     db.add(key_record)
     db.commit()
     db.refresh(key_record)
-
     return AnnotatorRegisterResponse(
         annotator_id=key_record.annotator_id,
+        task_id=key_record.task_id,
         api_key=raw_api_key,
-        created_at=key_record.created_at
+        created_at=key_record.created_at,
     )
+
+
+@app.delete("/annotators/{annotator_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_annotator_key(
+    annotator_id: str,
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_api_key),
+):
+    """Revoke an annotator credential; submitted annotations remain in the task history."""
+    key_record = db.query(AnnotatorApiKey).filter(AnnotatorApiKey.annotator_id == annotator_id).first()
+    if not key_record:
+        raise HTTPException(status_code=404, detail="Annotator credential not found.")
+    db.delete(key_record)
+    db.commit()
+    return None
+
+
+@app.post("/quotes", response_model=QuoteResponse, status_code=status.HTTP_201_CREATED)
+def create_quote_request(payload: QuoteCreate, db: Session = Depends(get_db)):
+    """Persist a project scoping request; this endpoint does not send email or create a price quote."""
+    quote = QuoteRequest(
+        full_name=payload.full_name,
+        email=str(payload.email),
+        organization=payload.organization,
+        role=payload.role,
+        project_type=payload.project_type,
+        imagery_type=payload.imagery_type,
+        spatial_resolution=payload.spatial_resolution,
+        estimated_volume=payload.estimated_volume,
+        timeline=payload.timeline,
+        target_accuracy=payload.target_accuracy,
+        budget_range=payload.budget_range,
+        requirements_description=payload.requirements_description,
+        accepted_terms=payload.accepts_terms,
+        status="received",
+    )
+    db.add(quote)
+    db.commit()
+    db.refresh(quote)
+    return QuoteResponse(id=quote.id, status=quote.status, submitted_at=quote.created_at)
 
 
 @app.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: TaskCreate,
     db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Create a new human-in-the-loop geospatial annotation task.
-    """
+    """Create a task record. Imagery URIs are stored; this endpoint does not ingest or copy imagery."""
+    webhook_url = str(payload.webhook_url) if payload.webhook_url else None
+    require_allowed_webhook(webhook_url)
     new_task = Task(
         raster_url=payload.raster_url,
         crs=payload.crs,
         target_annotator_count=payload.target_annotator_count,
-        webhook_url=payload.webhook_url,
-        status="queued"
+        webhook_url=webhook_url,
+        status="queued",
     )
     new_task.taxonomy = payload.taxonomy
-
     db.add(new_task)
     db.commit()
     db.refresh(new_task)
@@ -160,17 +232,26 @@ def create_task(
 @app.get("/tasks/{task_id}", response_model=TaskResponse)
 def get_task_status(
     task_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Check status, metadata, and progress of an annotation task.
-    """
+    """Retrieve status and metadata for a task using the service API key."""
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Annotation task '{task_id}' not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Annotation task '{task_id}' not found.")
+    return task
+
+
+@app.get("/annotator/tasks/{task_id}", response_model=AnnotatorTaskResponse)
+def get_assigned_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    annotator_id: str = Depends(get_current_annotator),
+):
+    """Return only the task associated with the supplied annotator credential."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Annotation task '{task_id}' not found.")
     return task
 
 
@@ -178,34 +259,27 @@ def get_task_status(
 def get_task_results(
     task_id: str,
     db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Download completed annotations as GeoJSON, including Inter-Annotator Agreement (IAA) score.
-    """
+    """Return agreement-supported GeoJSON for a task."""
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Annotation task '{task_id}' not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Annotation task '{task_id}' not found.")
 
     annotations = db.query(Annotation).filter(Annotation.task_id == task_id).all()
     ann_dicts = [{"annotator_id": a.annotator_id, "geojson": a.geojson} for a in annotations]
-
     geojson_consensus = build_consensus_geojson(
         ann_dicts,
-        iaa_score=task.iaa_score or 0.0,
-        crs=task.crs
+        iaa_score=task.iaa_score,
+        crs=task.crs,
     )
-
     return TaskResultsResponse(
         task_id=task.id,
         status=task.status,
         iaa_score=task.iaa_score,
         iaa_type=task.iaa_type,
         annotation_count=len(annotations),
-        geojson=geojson_consensus
+        geojson=geojson_consensus,
     )
 
 
@@ -214,202 +288,96 @@ def register_webhook(
     task_id: str,
     payload: WebhookRegister,
     db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
+    authenticated: bool = Depends(verify_api_key),
 ):
-    """
-    Register or update a callback webhook URL for task completion notification.
-    """
+    """Register or update a task-completion webhook URL."""
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Annotation task '{task_id}' not found."
-        )
-
-    task.webhook_url = payload.webhook_url
-    task.updated_at = datetime.utcnow()
+        raise HTTPException(status_code=404, detail=f"Annotation task '{task_id}' not found.")
+    require_allowed_webhook(str(payload.webhook_url))
+    task.webhook_url = str(payload.webhook_url)
+    task.updated_at = utcnow_naive()
     db.commit()
     db.refresh(task)
     return task
 
 
-@app.post("/tasks/{task_id}/annotations", response_model=TaskResponse)
+@app.post("/tasks/{task_id}/annotations", response_model=AnnotatorTaskResponse)
 def submit_annotation(
     task_id: str,
     payload: AnnotationSubmit,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    annotator_id: str = Depends(get_current_annotator)
+    annotator_id: str = Depends(get_current_annotator),
 ):
-    """
-    Submit a human specialist annotation for a task.
-    Requires authentic annotator API key (passed in X-Annotator-API-Key or Bearer header).
-    Uses database row locking (SELECT FOR UPDATE) to safely calculate completion status.
-    Prevents duplicate submissions from the same annotator on a task.
-    """
-    # Use SELECT FOR UPDATE row-level lock on Task
+    """Accept one GeoJSON FeatureCollection per registered annotator and task."""
     task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
     if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Annotation task '{task_id}' not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Annotation task '{task_id}' not found.")
+    if task.status == "completed":
+        raise HTTPException(status_code=409, detail="This task already has its required annotations.")
 
-    # Check for duplicate submission by this annotator on this task
-    existing_annotation = db.query(Annotation).filter(
+    existing = db.query(Annotation).filter(
         Annotation.task_id == task_id,
-        Annotation.annotator_id == annotator_id
+        Annotation.annotator_id == annotator_id,
     ).first()
-    if existing_annotation:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Annotator '{annotator_id}' has already submitted an annotation for task '{task_id}'."
-        )
+    if existing:
+        raise HTTPException(status_code=409, detail="This annotator has already submitted an annotation for this task.")
 
-    # Reproject incoming GeoJSON to the task's stored CRS before saving
     try:
         reprojected_geojson = reproject_feature_collection(payload.geojson, task.crs)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Submission CRS reprojection failed: {str(e)}"
-        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Submission CRS reprojection failed: {exc}") from exc
 
-    # Save human annotation with reprojected features and authenticated annotator_id
-    annotation = Annotation(
-        task_id=task_id,
-        annotator_id=annotator_id
-    )
-    annotation.geojson = reprojected_geojson
-    db.add(annotation)
-    db.flush()  # Make annotation visible to subsequent query in this transaction
-
-    # Fetch all annotations under row-level lock
-    all_annotations = db.query(Annotation).filter(Annotation.task_id == task_id).all()
-    ann_dicts = [{"annotator_id": a.annotator_id, "geojson": a.geojson} for a in all_annotations]
-
-    task.status = "in_progress"
-
-    if len(all_annotations) >= task.target_annotator_count:
-        iaa_score, iaa_type = compute_task_iaa(ann_dicts, task.taxonomy)
-        task.status = "completed"
-        task.iaa_score = iaa_score
-        task.iaa_type = iaa_type
-        task.completed_at = datetime.utcnow()
-
-        if task.webhook_url:
-            task_dict = {
-                "id": task.id,
-                "status": task.status,
-                "iaa_score": task.iaa_score,
-                "iaa_type": task.iaa_type,
-                "completed_at": task.completed_at
-            }
-            background_tasks.add_task(trigger_webhook_callback, task.webhook_url, task_dict)
-
-    task.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(task)
-    return task
-
-
-@app.post("/tasks/{task_id}/simulate-completion", response_model=TaskResponse)
-def simulate_task_completion(
-    task_id: str,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key)
-):
-    """
-    Helper endpoint: Simulates human specialist annotators completing the task.
-    Generates realistic vector geometries with high inter-annotator agreement.
-    Uses row-level locking to safely update completion state.
-    """
-    task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
-    if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Annotation task '{task_id}' not found."
-        )
-
-    categories = task.taxonomy if task.taxonomy else ["building_footprint"]
-    
-    # Generate annotations matching target_annotator_count
-    for i in range(task.target_annotator_count):
-        annotator_id = f"specialist_annotator_{i+1}"
-        
-        existing = db.query(Annotation).filter(
-            Annotation.task_id == task_id,
-            Annotation.annotator_id == annotator_id
-        ).first()
-        if existing:
-            continue
-
-        cat = categories[i % len(categories)]
-        sample_geojson = {
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [
-                            [
-                                [-122.4194 + (i * 0.0001), 37.7749 + (i * 0.0001)],
-                                [-122.4180 + (i * 0.0001), 37.7749 + (i * 0.0001)],
-                                [-122.4180 + (i * 0.0001), 37.7760 + (i * 0.0001)],
-                                [-122.4194 + (i * 0.0001), 37.7760 + (i * 0.0001)],
-                                [-122.4194 + (i * 0.0001), 37.7749 + (i * 0.0001)]
-                            ]
-                        ]
-                    },
-                    "properties": {
-                        "category": cat,
-                        "confidence": 0.98,
-                        "orthogonal_rectified": True
-                    }
-                }
-            ]
-        }
-        
-        try:
-            sample_geojson_reprojected = reproject_feature_collection(sample_geojson, task.crs)
-        except ValueError as e:
+    allowed_categories = set(task.taxonomy)
+    for index, feature in enumerate(reprojected_geojson.get("features", [])):
+        properties = feature.get("properties")
+        category = properties.get("category") if isinstance(properties, dict) else None
+        if not isinstance(category, str) or category not in allowed_categories:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Sample annotation CRS reprojection failed: {str(e)}"
+                detail=f"features[{index}].properties.category must match a task taxonomy label.",
             )
-        ann = Annotation(task_id=task_id, annotator_id=annotator_id)
-        ann.geojson = sample_geojson_reprojected
-        db.add(ann)
+        if not isinstance(feature.get("geometry"), dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"features[{index}].geometry must be a GeoJSON geometry object.",
+            )
 
-    db.flush()
+    annotation = Annotation(task_id=task_id, annotator_id=annotator_id)
+    annotation.geojson = reprojected_geojson
+    db.add(annotation)
+    try:
+        db.flush()
+        all_annotations = db.query(Annotation).filter(Annotation.task_id == task_id).all()
+        task.status = "in_progress"
 
-    all_annotations = db.query(Annotation).filter(Annotation.task_id == task_id).all()
-    ann_dicts = [{"annotator_id": a.annotator_id, "geojson": a.geojson} for a in all_annotations]
+        if len(all_annotations) >= task.target_annotator_count:
+            ann_dicts = [{"annotator_id": item.annotator_id, "geojson": item.geojson} for item in all_annotations]
+            task.iaa_score, task.iaa_type = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
+            task.status = "completed"
+            task.completed_at = utcnow_naive()
 
-    iaa_score, iaa_type = compute_task_iaa(ann_dicts, task.taxonomy)
-    task.status = "completed"
-    task.iaa_score = iaa_score
-    task.iaa_type = iaa_type
-    task.completed_at = datetime.utcnow()
-    task.updated_at = datetime.utcnow()
+        task.updated_at = utcnow_naive()
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This annotator has already submitted an annotation for this task.") from exc
 
-    if task.webhook_url:
-        task_dict = {
+    db.refresh(task)
+    if task.status == "completed" and task.webhook_url:
+        task_data = {
             "id": task.id,
             "status": task.status,
             "iaa_score": task.iaa_score,
             "iaa_type": task.iaa_type,
-            "completed_at": task.completed_at
+            "completed_at": task.completed_at,
         }
-        background_tasks.add_task(trigger_webhook_callback, task.webhook_url, task_dict)
-
-    db.commit()
-    db.refresh(task)
+        background_tasks.add_task(trigger_webhook_callback, task.webhook_url, task_data)
     return task
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)

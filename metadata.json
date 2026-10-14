@@ -1,6 +1,13 @@
 {
   "name": "GeoLabel",
-  "description": "Expert geospatial data annotation service connecting AI/ML teams with GIS-trained annotators for satellite, drone, and aerial ML models.",
+  "description": "GeoJSON-first geospatial annotation API MVP with persisted task intake, task-scoped annotator credentials, CRS reprojection, agreement scoring, and scoping-request storage.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "Task API",
+    "Task-scoped annotator credentials",
+    "GeoJSON annotation submission",
+    "CRS reprojection",
+    "Agreement and consensus output",
+    "Persisted scoping requests"
+  ]
 }
