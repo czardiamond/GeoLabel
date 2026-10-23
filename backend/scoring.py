@@ -1,48 +1,78 @@
-"""
-GeoLabel Inter-Annotator Agreement (IAA) Scoring Engine
-Computes real Cohen's Kappa (for 2 annotators) and Fleiss' Kappa (for 3+ annotators)
-on human-in-the-loop specialist annotations with geometry-type-aware spatial matching.
+"""CRS-aware spatial matching, inter-annotator agreement, and consensus export."""
 
-FIXES over previous version:
-1. compute_iou() now branches by geometry type. Polygons use true area IoU.
-   LineStrings are compared by buffering to a tolerance corridor, then IoU on
-   the buffered shapes. Points are compared by distance threshold (converted
-   to a pseudo-IoU-style score so downstream logic is unchanged).
-2. Fleiss clustering no longer uses BFS connected-components (which lets
-   unrelated features "chain" together transitively: A~B~C even if A and C
-   don't overlap). It instead uses greedy global best-match matching across
-   all rater pairs, similar in spirit to the Cohen's Kappa matching, which
-   guarantees no two features from the same annotator ever land in the same
-   cluster and no chaining occurs.
-"""
-
-from typing import List, Dict, Any, Tuple, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 import math
-from shapely.geometry import shape, Point, LineString, Polygon
+import json
+
+from pyproj import CRS, Transformer
+from shapely import transform as shapely_transform
+from shapely.affinity import scale
+from shapely.geometry import Polygon, shape
 from shapely.geometry.base import BaseGeometry
 
-# Tunable defaults for projected CRS units (meters). A line "matches" if buffered
-# corridors overlap enough; a point "matches" if within this distance (e.g. 0.5 meters).
 DEFAULT_LINE_BUFFER = 0.5
 DEFAULT_POINT_DISTANCE_THRESHOLD = 0.5
+DEFAULT_IOU_THRESHOLD = 0.5
+SCORER_VERSION = "geolabel-heuristic-v1"
+
+
+def scoring_configuration() -> Dict[str, Any]:
+    """Return the explicit, serializable configuration for this heuristic scorer."""
+    return {
+        "version": SCORER_VERSION,
+        "iou_threshold": DEFAULT_IOU_THRESHOLD,
+        "line_buffer_m": DEFAULT_LINE_BUFFER,
+        "point_distance_threshold_m": DEFAULT_POINT_DISTANCE_THRESHOLD,
+        "consensus_support": "strict_majority",
+        "tie_break": "canonical_geojson_then_index",
+    }
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 def _safe_shape(geom_dict: Dict[str, Any]) -> Optional[BaseGeometry]:
-    """Parses a GeoJSON geometry dict into a Shapely geometry, repairing
-    invalid polygons where possible. Returns None on failure."""
-    if not geom_dict:
+    if not isinstance(geom_dict, dict):
         return None
     try:
-        geom = shape(geom_dict)
-        if geom.is_empty:
+        geometry = shape(geom_dict)
+        if geometry.is_empty:
             return None
-        if isinstance(geom, Polygon) and not geom.is_valid:
-            geom = geom.buffer(0)
-            if geom.is_empty:
-                return None
-        return geom
+        if isinstance(geometry, Polygon) and not geometry.is_valid:
+            geometry = geometry.buffer(0)
+        return None if geometry.is_empty else geometry
     except Exception:
         return None
+
+
+def _project_pair_to_meters(
+    geom1: BaseGeometry, geom2: BaseGeometry, crs: str
+) -> Tuple[BaseGeometry, BaseGeometry]:
+    """Project geographic pairs locally or convert projected axes to meters."""
+    source = CRS.from_user_input(crs)
+    if source.is_geographic:
+        center = geom1.union(geom2).centroid
+        local = CRS.from_proj4(
+            f"+proj=aeqd +lat_0={center.y:.10f} +lon_0={center.x:.10f} "
+            "+datum=WGS84 +units=m +no_defs"
+        )
+        transformer = Transformer.from_crs(source, local, always_xy=True)
+        return (
+            shapely_transform(geom1, transformer.transform, include_z=geom1.has_z, interleaved=False),
+            shapely_transform(geom2, transformer.transform, include_z=geom2.has_z, interleaved=False),
+        )
+    if source.is_projected:
+        factor = source.axis_info[0].unit_conversion_factor if source.axis_info else 1.0
+        factor = factor or 1.0
+        if math.isclose(factor, 1.0):
+            return geom1, geom2
+        return (
+            scale(geom1, xfact=factor, yfact=factor, origin=(0, 0)),
+            scale(geom2, xfact=factor, yfact=factor, origin=(0, 0)),
+        )
+    raise ValueError("Agreement scoring requires a geographic or projected CRS")
 
 
 def compute_iou(
@@ -50,409 +80,271 @@ def compute_iou(
     geom2_dict: Dict[str, Any],
     line_buffer: float = DEFAULT_LINE_BUFFER,
     point_distance_threshold: float = DEFAULT_POINT_DISTANCE_THRESHOLD,
+    crs: str = "EPSG:3857",
 ) -> float:
-    """
-    Computes a spatial overlap score between two GeoJSON geometries, branching
-    by geometry type since raw area-IoU is meaningless for lines and points
-    (they have zero area and would always return 0.0).
-
-    - Polygon vs Polygon: true area IoU = Area(intersection) / Area(union).
-    - LineString vs LineString: buffer both lines into corridors of width
-      `line_buffer`, then compute area IoU on the corridors. This rewards
-      lines that run along a similar path even if they're not pixel-identical.
-    - Point vs Point: returns 1.0 if within `point_distance_threshold` of each
-      other, decaying linearly to 0.0 at 2x that distance, else 0.0. This
-      keeps the return value in the same [0, 1] range the rest of the pipeline
-      expects, so it can be thresholded the same way as polygon/line IoU.
-    - Mismatched geometry types (e.g. a Point vs a Polygon) are treated as
-      non-comparable and return 0.0 — they should never be considered the
-      same real-world feature.
-
-    Returns 0.0 on any invalid/unparseable geometry.
-    """
-    s1 = _safe_shape(geom1_dict)
-    s2 = _safe_shape(geom2_dict)
-    if s1 is None or s2 is None:
+    """Return geometry-aware overlap in [0, 1], with thresholds interpreted in meters."""
+    geom1 = _safe_shape(geom1_dict)
+    geom2 = _safe_shape(geom2_dict)
+    if geom1 is None or geom2 is None:
         return 0.0
 
-    type1 = s1.geom_type
-    type2 = s2.geom_type
-
-    is_poly1 = type1 in ("Polygon", "MultiPolygon")
-    is_poly2 = type2 in ("Polygon", "MultiPolygon")
-    is_line1 = type1 in ("LineString", "MultiLineString")
-    is_line2 = type2 in ("LineString", "MultiLineString")
-    is_point1 = type1 in ("Point", "MultiPoint")
-    is_point2 = type2 in ("Point", "MultiPoint")
+    type1, type2 = geom1.geom_type, geom2.geom_type
+    is_polygon_pair = type1 in ("Polygon", "MultiPolygon") and type2 in ("Polygon", "MultiPolygon")
+    is_line_pair = type1 in ("LineString", "MultiLineString") and type2 in ("LineString", "MultiLineString")
+    is_point_pair = type1 in ("Point", "MultiPoint") and type2 in ("Point", "MultiPoint")
+    if not (is_polygon_pair or is_line_pair or is_point_pair):
+        return 0.0
 
     try:
-        if is_poly1 and is_poly2:
-            intersection = s1.intersection(s2).area
-            union = s1.union(s2).area
-            if union <= 0.0:
-                return 0.0
-            return intersection / union
-
-        if is_line1 and is_line2:
-            corridor1 = s1.buffer(line_buffer)
-            corridor2 = s2.buffer(line_buffer)
-            intersection = corridor1.intersection(corridor2).area
+        geom1, geom2 = _project_pair_to_meters(geom1, geom2, crs)
+        if is_polygon_pair:
+            union = geom1.union(geom2).area
+            return geom1.intersection(geom2).area / union if union > 0 else 0.0
+        if is_line_pair:
+            corridor1, corridor2 = geom1.buffer(line_buffer), geom2.buffer(line_buffer)
             union = corridor1.union(corridor2).area
-            if union <= 0.0:
-                return 0.0
-            return intersection / union
+            return corridor1.intersection(corridor2).area / union if union > 0 else 0.0
 
-        if is_point1 and is_point2:
-            distance = s1.distance(s2)
-            if distance <= point_distance_threshold:
-                return 1.0
-            elif distance >= point_distance_threshold * 2:
-                return 0.0
-            else:
-                # Linear decay between threshold and 2x threshold
-                return 1.0 - ((distance - point_distance_threshold) / point_distance_threshold)
-
-        # Mismatched geometry types (e.g. point vs polygon) are never the
-        # same real-world feature.
-        return 0.0
+        distance = geom1.distance(geom2)
+        if distance <= point_distance_threshold:
+            return 1.0
+        if distance >= point_distance_threshold * 2:
+            return 0.0
+        return 1.0 - ((distance - point_distance_threshold) / point_distance_threshold)
     except Exception:
         return 0.0
 
 
-def _greedy_global_match(
-    pairwise_candidates: List[Tuple[float, Any, Any]]
-) -> List[Tuple[Any, Any]]:
-    """
-    Given a list of (score, key_a, key_b) candidate pairs, greedily selects
-    the highest-scoring pairs such that each key_a and key_b is used at most
-    once. Shared helper for both Cohen's and Fleiss' matching so the matching
-    strategy is consistent everywhere in this module.
-    """
-    pairwise_candidates.sort(key=lambda x: x[0], reverse=True)
-    used_a = set()
-    used_b = set()
-    matches = []
-    for score, key_a, key_b in pairwise_candidates:
-        if key_a in used_a or key_b in used_b:
+def _greedy_global_match(candidates: List[Tuple[float, Any, Any]]) -> List[Tuple[Any, Any]]:
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    used_left, used_right, matches = set(), set(), []
+    for score, left, right in candidates:
+        if left in used_left or right in used_right:
             continue
-        used_a.add(key_a)
-        used_b.add(key_b)
-        matches.append((key_a, key_b))
+        used_left.add(left)
+        used_right.add(right)
+        matches.append((left, right))
     return matches
 
 
 def match_features_cohen(
     features_a: List[Dict[str, Any]],
     features_b: List[Dict[str, Any]],
-    iou_threshold: float = 0.5
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:3857",
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    SPATIAL MATCHING STEP FOR COHEN'S KAPPA:
-    Pairs features drawn by Annotator A and Annotator B based on geometry-
-    type-aware spatial overlap (see compute_iou). Only pairs with overlap
-    score >= iou_threshold are considered candidates for agreement.
-
-    Unmatched features on either side represent spatial disagreements (one
-    annotator drew a feature where the other drew nothing, or their features
-    didn't overlap enough to count as the same real-world object).
-    """
+    # Canonical feature order makes equal-overlap greedy matches independent of
+    # client feature-array ordering while preserving the original feature data.
+    features_a = sorted(features_a, key=_stable_json)
+    features_b = sorted(features_b, key=_stable_json)
     candidates = []
-    for idx_a, fa in enumerate(features_a):
-        geom_a = fa.get("geometry", {})
-        for idx_b, fb in enumerate(features_b):
-            geom_b = fb.get("geometry", {})
-            score = compute_iou(geom_a, geom_b)
+    for idx_a, feature_a in enumerate(features_a):
+        for idx_b, feature_b in enumerate(features_b):
+            score = compute_iou(feature_a.get("geometry", {}), feature_b.get("geometry", {}), crs=crs)
             if score >= iou_threshold:
                 candidates.append((score, idx_a, idx_b))
 
-    matched_idx_pairs = _greedy_global_match(candidates)
-    matched_a_idx = {a for a, b in matched_idx_pairs}
-    matched_b_idx = {b for a, b in matched_idx_pairs}
+    pairs = _greedy_global_match(candidates)
+    matched_a = {idx_a for idx_a, _ in pairs}
+    matched_b = {idx_b for _, idx_b in pairs}
+    return (
+        [(features_a[a], features_b[b]) for a, b in pairs],
+        [feature for idx, feature in enumerate(features_a) if idx not in matched_a],
+        [feature for idx, feature in enumerate(features_b) if idx not in matched_b],
+    )
 
-    matched_pairs = [(features_a[a], features_b[b]) for a, b in matched_idx_pairs]
-    unmatched_a = [fa for idx, fa in enumerate(features_a) if idx not in matched_a_idx]
-    unmatched_b = [fb for idx, fb in enumerate(features_b) if idx not in matched_b_idx]
 
-    return matched_pairs, unmatched_a, unmatched_b
+def _category(feature: Dict[str, Any], allowed: List[str]) -> str:
+    value = feature.get("properties", {}).get("category", "default_category")
+    return value if value in allowed else "default_category"
+
+
+def _kappa(observed: float, expected: float) -> float:
+    if math.isclose(1.0, expected):
+        value = 1.0 if math.isclose(observed, 1.0) else 0.0
+    else:
+        value = (observed - expected) / (1.0 - expected)
+    # Cohen/Fleiss kappa can legitimately be negative; do not conceal disagreement.
+    return round(max(-1.0, min(1.0, value)), 4)
 
 
 def calculate_cohens_kappa(
     annotations: List[Dict[str, Any]],
     taxonomy: List[str],
-    iou_threshold: float = 0.5
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:3857",
 ) -> float:
-    """
-    Computes Cohen's Kappa (κ) for exactly 2 annotators across category
-    assignments AND geometry-type-aware spatial overlap.
-
-    Step 1: Spatially match features between Annotator A & B (compute_iou >= iou_threshold).
-    Step 2: Compare taxonomy category assignments for matched pairs.
-    Step 3: Unmatched features count as disagreements against 'no_feature'.
-    """
     if len(annotations) < 2:
         return 1.0
-
-    annotator_a = annotations[0].get("geojson", {})
-    annotator_b = annotations[1].get("geojson", {})
-
-    features_a = annotator_a.get("features", [])
-    features_b = annotator_b.get("features", [])
-
+    features_a = annotations[0].get("geojson", {}).get("features", [])
+    features_b = annotations[1].get("geojson", {}).get("features", [])
     if not features_a and not features_b:
         return 1.0
 
-    matched_pairs, unmatched_a, unmatched_b = match_features_cohen(
-        features_a, features_b, iou_threshold=iou_threshold
+    matched, unmatched_a, unmatched_b = match_features_cohen(
+        features_a, features_b, iou_threshold=iou_threshold, crs=crs
     )
-
-    NO_FEATURE = "no_feature"
+    no_feature = "no_feature"
     categories = list(taxonomy) if taxonomy else ["default_category"]
-    if NO_FEATURE not in categories:
-        categories.append(NO_FEATURE)
-
-    total_items = len(matched_pairs) + len(unmatched_a) + len(unmatched_b)
-    if total_items == 0:
-        return 1.0
-
+    categories = list(dict.fromkeys(categories + ["default_category", no_feature]))
+    if not categories:
+        categories = [no_feature]
+    counts_a, counts_b = Counter(), Counter()
     agreements = 0
-    cat_counts_a = {cat: 0 for cat in categories}
-    cat_counts_b = {cat: 0 for cat in categories}
-
-    for fa, fb in matched_pairs:
-        cat_a = fa.get("properties", {}).get("category", categories[0])
-        cat_b = fb.get("properties", {}).get("category", categories[0])
-        if cat_a not in cat_counts_a:
-            cat_a = categories[0]
-        if cat_b not in cat_counts_b:
-            cat_b = categories[0]
-        cat_counts_a[cat_a] += 1
-        cat_counts_b[cat_b] += 1
-        if cat_a == cat_b:
-            agreements += 1
-
-    for fa in unmatched_a:
-        cat_a = fa.get("properties", {}).get("category", categories[0])
-        if cat_a not in cat_counts_a:
-            cat_a = categories[0]
-        cat_counts_a[cat_a] += 1
-        cat_counts_b[NO_FEATURE] += 1
-
-    for fb in unmatched_b:
-        cat_b = fb.get("properties", {}).get("category", categories[0])
-        if cat_b not in cat_counts_b:
-            cat_b = categories[0]
-        cat_counts_b[cat_b] += 1
-        cat_counts_a[NO_FEATURE] += 1
-
-    po = agreements / float(total_items)
-
-    pe = 0.0
-    for cat in categories:
-        p_a = cat_counts_a[cat] / float(total_items)
-        p_b = cat_counts_b[cat] / float(total_items)
-        pe += (p_a * p_b)
-
-    if pe >= 1.0:
+    total = len(matched) + len(unmatched_a) + len(unmatched_b)
+    if total == 0:
         return 1.0
 
-    kappa = (po - pe) / (1.0 - pe)
-    return round(max(0.0, min(1.0, kappa)), 4)
+    for feature_a, feature_b in matched:
+        cat_a, cat_b = _category(feature_a, categories), _category(feature_b, categories)
+        counts_a[cat_a] += 1
+        counts_b[cat_b] += 1
+        agreements += int(cat_a == cat_b)
+    for feature in unmatched_a:
+        counts_a[_category(feature, categories)] += 1
+        counts_b[no_feature] += 1
+    for feature in unmatched_b:
+        counts_b[_category(feature, categories)] += 1
+        counts_a[no_feature] += 1
+
+    observed = agreements / total
+    expected = sum((counts_a[cat] / total) * (counts_b[cat] / total) for cat in categories)
+    return _kappa(observed, expected)
 
 
 def cluster_features_fleiss(
     annotations: List[Dict[str, Any]],
-    iou_threshold: float = 0.5
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:3857",
 ) -> List[Dict[int, Dict[str, Any]]]:
-    """
-    SPATIAL CLUSTERING STEP FOR FLEISS' KAPPA (N >= 3 raters).
-
-    IMPORTANT: this does NOT use BFS/connected-components over the overlap
-    graph. Connected-components allows transitive chaining — if feature A
-    overlaps B, and B overlaps C, but A and C do not overlap each other,
-    naive BFS would still group A, B, and C into a single "same real-world
-    object" cluster. That's wrong: A and C may be two different buildings
-    that both happen to be near the same third building.
-
-    Instead, this builds clusters via iterative greedy global best-match,
-    reusing the same pairwise-matching approach as Cohen's Kappa:
-      1. Treat rater 0's features as the seed clusters.
-      2. For each subsequent rater, greedily match their features against
-         the current cluster set using the highest available IoU/overlap
-         score (>= iou_threshold), one feature per cluster, one cluster per
-         feature.
-      3. Unmatched features from that rater start new clusters.
-    This guarantees no two features from the same rater ever land in the
-    same cluster, and no chaining through an intermediate feature.
-    """
-    n_raters = len(annotations)
-    rater_features: List[List[Dict[str, Any]]] = [
-        ann.get("geojson", {}).get("features", []) for ann in annotations
+    """Greedily match each rater's objects without transitive overlap chaining."""
+    ordered_annotations = sorted(annotations, key=lambda ann: (str(ann.get("annotator_id", "")), _stable_json(ann.get("geojson", {}))))
+    rater_features = [
+        sorted(ann.get("geojson", {}).get("features", []), key=_stable_json)
+        for ann in ordered_annotations
     ]
-
-    if not any(rater_features):
+    seed_idx = next((idx for idx, features in enumerate(rater_features) if features), None)
+    if seed_idx is None:
         return []
+    clusters: List[Dict[int, Dict[str, Any]]] = [{seed_idx: feature} for feature in rater_features[seed_idx]]
 
-    # Seed clusters from the first non-empty rater's features.
-    clusters: List[Dict[int, Dict[str, Any]]] = []
-    seed_rater_idx = None
-    for idx, feats in enumerate(rater_features):
-        if feats:
-            seed_rater_idx = idx
-            break
-    if seed_rater_idx is None:
-        return []
-
-    for f in rater_features[seed_rater_idx]:
-        clusters.append({seed_rater_idx: f})
-
-    for rater_idx in range(n_raters):
-        if rater_idx == seed_rater_idx:
+    for rater_idx, features in enumerate(rater_features):
+        if rater_idx == seed_idx or not features:
             continue
-        feats = rater_features[rater_idx]
-        if not feats:
-            continue
-
         candidates = []
-        for cluster_idx, cluster_map in enumerate(clusters):
-            # Compare against any one existing feature already in the cluster
-            # (representative geometry) to decide if this rater's feature
-            # belongs to the same real-world object.
-            existing_geom = None
-            for existing_feat in cluster_map.values():
-                existing_geom = existing_feat.get("geometry", {})
-                break
-            if existing_geom is None:
-                continue
-            for feat_idx, f in enumerate(feats):
-                score = compute_iou(existing_geom, f.get("geometry", {}))
-                if score >= iou_threshold:
-                    candidates.append((score, cluster_idx, feat_idx))
-
-        matched = _greedy_global_match(candidates)
-        matched_feat_idx = set()
-        for cluster_idx, feat_idx in matched:
-            clusters[cluster_idx][rater_idx] = feats[feat_idx]
-            matched_feat_idx.add(feat_idx)
-
-        # Unmatched features from this rater start their own new clusters.
-        for feat_idx, f in enumerate(feats):
-            if feat_idx not in matched_feat_idx:
-                clusters.append({rater_idx: f})
-
+        for cluster_idx, cluster in enumerate(clusters):
+            representative = next(iter(cluster.values()))
+            for feature_idx, feature in enumerate(features):
+                overlap = compute_iou(
+                    representative.get("geometry", {}), feature.get("geometry", {}), crs=crs
+                )
+                if overlap >= iou_threshold:
+                    candidates.append((overlap, cluster_idx, feature_idx))
+        matches = _greedy_global_match(candidates)
+        matched_features = set()
+        for cluster_idx, feature_idx in matches:
+            clusters[cluster_idx][rater_idx] = features[feature_idx]
+            matched_features.add(feature_idx)
+        for feature_idx, feature in enumerate(features):
+            if feature_idx not in matched_features:
+                clusters.append({rater_idx: feature})
     return clusters
 
 
 def calculate_fleiss_kappa(
     annotations: List[Dict[str, Any]],
     taxonomy: List[str],
-    iou_threshold: float = 0.5
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:3857",
 ) -> float:
-    """
-    Computes Fleiss' Kappa (κ) for N >= 3 raters evaluating categorical
-    assignments AND geometry-type-aware spatial overlap.
-
-    κ = (P_bar - Pe_bar) / (1 - Pe_bar)
-    """
     n_raters = len(annotations)
     if n_raters < 3:
-        return calculate_cohens_kappa(annotations, taxonomy, iou_threshold=iou_threshold)
+        return calculate_cohens_kappa(annotations, taxonomy, iou_threshold=iou_threshold, crs=crs)
 
-    clusters = cluster_features_fleiss(annotations, iou_threshold=iou_threshold)
-
+    clusters = cluster_features_fleiss(annotations, iou_threshold=iou_threshold, crs=crs)
     if not clusters:
         return 1.0
 
-    NO_FEATURE = "no_feature"
-    categories = list(taxonomy) if taxonomy else ["default_category"]
-    if NO_FEATURE not in categories:
-        categories.append(NO_FEATURE)
-
-    n_items = len(clusters)
-
-    n_matrix = []
-    for cluster_map in clusters:
-        row_counts = {cat: 0 for cat in categories}
+    no_feature = "no_feature"
+    categories = list(dict.fromkeys((taxonomy or ["default_category"]) + ["default_category", no_feature]))
+    item_agreements = []
+    category_totals = Counter()
+    for cluster in clusters:
+        ratings = []
         for rater_idx in range(n_raters):
-            if rater_idx in cluster_map:
-                feat = cluster_map[rater_idx]
-                cat = feat.get("properties", {}).get("category", categories[0])
-                if cat not in row_counts:
-                    cat = categories[0]
-                row_counts[cat] += 1
-            else:
-                row_counts[NO_FEATURE] += 1
-        n_matrix.append([row_counts[cat] for cat in categories])
+            feature = cluster.get(rater_idx)
+            rating = _category(feature, categories) if feature else no_feature
+            ratings.append(rating)
+            category_totals[rating] += 1
+        counts = Counter(ratings)
+        item_agreements.append(sum(count * count for count in counts.values()) - n_raters)
 
-    p_i_list = []
-    for row in n_matrix:
-        row_sq_sum = sum(x * x for x in row)
-        p_i = (row_sq_sum - n_raters) / float(n_raters * (n_raters - 1)) if n_raters > 1 else 1.0
-        p_i_list.append(p_i)
-
-    p_bar = sum(p_i_list) / float(n_items) if n_items > 0 else 1.0
-
-    total_ratings = n_items * n_raters
-    p_j_list = []
-    for j in range(len(categories)):
-        col_sum = sum(n_matrix[i][j] for i in range(n_items))
-        p_j = col_sum / float(total_ratings) if total_ratings > 0 else 0
-        p_j_list.append(p_j)
-
-    pe_bar = sum(pj * pj for pj in p_j_list)
-
-    if pe_bar >= 1.0:
-        return 1.0
-
-    kappa = (p_bar - pe_bar) / (1.0 - pe_bar)
-    return round(max(0.0, min(1.0, kappa)), 4)
+    p_bar = sum(item_agreements) / (len(clusters) * n_raters * (n_raters - 1))
+    total_ratings = len(clusters) * n_raters
+    p_e = sum((category_totals[cat] / total_ratings) ** 2 for cat in categories)
+    return _kappa(p_bar, p_e)
 
 
 def compute_task_iaa(
     annotations: List[Dict[str, Any]],
     taxonomy: List[str],
-    iou_threshold: float = 0.5
-) -> Tuple[float, str]:
-    """
-    Main entry point for calculating IAA score and returning (score, type).
-    """
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:4326",
+) -> Tuple[Optional[float], str]:
+    """Calculate kappa only when at least two independent annotations exist."""
     count = len(annotations)
-    if count == 0:
-        return (0.0, "insufficient_annotations")
-    elif count == 1:
-        return (1.0, "single_annotator_baseline")
-    elif count == 2:
-        score = calculate_cohens_kappa(annotations, taxonomy, iou_threshold=iou_threshold)
-        return (score, "cohens_kappa")
-    else:
-        score = calculate_fleiss_kappa(annotations, taxonomy, iou_threshold=iou_threshold)
-        return (score, "fleiss_kappa")
+    if count < 2:
+        return None, "insufficient_annotations"
+    if count == 2:
+        return calculate_cohens_kappa(annotations, taxonomy, iou_threshold=iou_threshold, crs=crs), "cohens_kappa"
+    return calculate_fleiss_kappa(annotations, taxonomy, iou_threshold=iou_threshold, crs=crs), "fleiss_kappa"
 
 
-def build_consensus_geojson(annotations: List[Dict[str, Any]], iaa_score: float, crs: str) -> Dict[str, Any]:
-    """
-    Combines individual specialist annotations into a consensus GeoJSON FeatureCollection.
-    """
-    combined_features = []
+def build_consensus_geojson(
+    annotations: List[Dict[str, Any]], iaa_score: Optional[float], crs: str
+) -> Dict[str, Any]:
+    """Export features with majority support using a medoid geometry and majority class."""
+    clusters = cluster_features_fleiss(annotations, crs=crs) if annotations else []
+    required_support = len(annotations) // 2 + 1
+    consensus_features = []
 
-    for ann_idx, ann in enumerate(annotations):
-        annotator_id = ann.get("annotator_id", f"annotator_{ann_idx + 1}")
-        feats = ann.get("geojson", {}).get("features", [])
-        for f in feats:
-            feature_copy = dict(f)
-            props = dict(feature_copy.get("properties", {}))
-            props["annotator_id"] = annotator_id
-            props["verification_status"] = "human_specialist_verified"
-            props["iaa_consensus_score"] = iaa_score
-            feature_copy["properties"] = props
-            combined_features.append(feature_copy)
+    for cluster in clusters:
+        if len(cluster) < required_support:
+            continue
+        category_counts = Counter(
+            str(feature.get("properties", {}).get("category", "default_category"))
+            for feature in cluster.values()
+        )
+        category, category_support = min(category_counts.items(), key=lambda item: (-item[1], item[0]))
+        if category_support < required_support:
+            continue
+
+        features = sorted(cluster.values(), key=_stable_json)
+        representative = max(
+            features,
+            key=lambda candidate: (
+                sum(
+                    compute_iou(candidate.get("geometry", {}), other.get("geometry", {}), crs=crs)
+                    for other in features
+                ),
+                _stable_json(candidate),
+            ),
+        )
+        feature_copy = dict(representative)
+        properties = dict(feature_copy.get("properties", {}))
+        properties.update({
+            "category": category,
+            "annotator_support": len(cluster),
+            "annotator_count": len(annotations),
+            "agreement_ratio": round(len(cluster) / len(annotations), 4),
+            "iaa_score": iaa_score,
+            "verification_status": "agreement_supported",
+        })
+        feature_copy["properties"] = properties
+        consensus_features.append(feature_copy)
 
     return {
         "type": "FeatureCollection",
-        "crs": {
-            "type": "name",
-            "properties": {
-                "name": crs
-            }
-        },
-        "features": combined_features
+        "crs": {"type": "name", "properties": {"name": crs}},
+        "features": consensus_features,
     }

@@ -5,10 +5,12 @@ services:
     region: oregon
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
+    startCommand: alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health/ready
     envVars:
       - key: GEOLABEL_API_KEY
         generateValue: true
       - key: DATABASE_URL
         value: sqlite:///./geolabel.db
+      - key: WEBHOOK_ALLOWED_HOSTS
+        value: ""

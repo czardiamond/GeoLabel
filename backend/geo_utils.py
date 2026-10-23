@@ -5,8 +5,8 @@ Provides CRS extraction and reprojection for GeoJSON features using pyproj and S
 
 from typing import Dict, Any
 import re
+from shapely import transform as shapely_transform
 from shapely.geometry import shape, mapping
-from shapely.ops import transform
 import pyproj
 
 
@@ -98,41 +98,45 @@ def reproject_geojson_feature(
     Raises ValueError on reprojection failure instead of returning original feature.
     """
     if not isinstance(feature, dict):
-        return feature
+        raise ValueError("Each annotation must be a GeoJSON Feature object")
+    geom_dict = feature.get("geometry")
+    if not isinstance(geom_dict, dict):
+        raise ValueError("Feature geometry must be a GeoJSON geometry object")
 
-    clean_source = source_crs.strip().upper()
-    clean_target = target_crs.strip().upper()
-
-    if clean_source == clean_target:
-        return feature
+    try:
+        s_geom = shape(geom_dict)
+    except Exception as exc:
+        raise ValueError(f"Invalid GeoJSON geometry: {exc}") from exc
+    if s_geom.is_empty:
+        raise ValueError("Empty geometries cannot be submitted as annotation features")
+    if not s_geom.is_valid:
+        raise ValueError("Invalid geometries cannot be submitted as annotation features")
 
     try:
         src_crs_obj = pyproj.CRS.from_user_input(source_crs)
         tgt_crs_obj = pyproj.CRS.from_user_input(target_crs)
         if src_crs_obj == tgt_crs_obj:
             return feature
-    except Exception:
-        pass
 
-    geom_dict = feature.get("geometry")
-    if not geom_dict:
-        return feature
-
-    try:
         transformer = pyproj.Transformer.from_crs(source_crs, target_crs, always_xy=True)
-        s_geom = shape(geom_dict)
-        if s_geom.is_empty:
-            return feature
-
-        reprojected_s_geom = transform(transformer.transform, s_geom)
+        reprojected_s_geom = shapely_transform(
+            s_geom,
+            transformer.transform,
+            include_z=s_geom.has_z,
+            interleaved=False,
+        )
+        if reprojected_s_geom.is_empty or not reprojected_s_geom.is_valid:
+            raise ValueError("Reprojection produced an empty or invalid geometry")
         new_feature = dict(feature)
         new_feature["geometry"] = mapping(reprojected_s_geom)
         return new_feature
-    except Exception as e:
+    except ValueError:
+        raise
+    except Exception as exc:
         raise ValueError(
             f"Failed to reproject feature geometry from source CRS '{source_crs}' "
-            f"to target CRS '{target_crs}': {str(e)}"
-        )
+            f"to target CRS '{target_crs}': {exc}"
+        ) from exc
 
 
 def reproject_feature_collection(

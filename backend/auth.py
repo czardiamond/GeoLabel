@@ -24,12 +24,13 @@ def generate_annotator_credentials() -> Tuple[str, str, str]:
     """
     import uuid
     annotator_id = f"ann_{uuid.uuid4().hex[:12]}"
-    raw_api_key = f"gl_ann_{secrets.token_hex(16)}"
+    raw_api_key = f"gl_ann_{secrets.token_hex(32)}"
     api_key_hash = hash_api_key(raw_api_key)
     return annotator_id, raw_api_key, api_key_hash
 
 
 def get_current_annotator(
+    task_id: str,
     x_annotator_api_key: Optional[str] = Header(None, alias="X-Annotator-API-Key"),
     credentials: Optional[HTTPAuthorizationCredentials] = Security(security_bearer),
     db: Session = Depends(get_db)
@@ -60,6 +61,12 @@ def get_current_annotator(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid annotator API key.",
             headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    if key_record.task_id != task_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This annotator credential is not assigned to the requested task.",
         )
 
     return key_record.annotator_id

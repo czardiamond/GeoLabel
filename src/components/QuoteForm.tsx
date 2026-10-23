@@ -1,658 +1,164 @@
-import React, { useState, useEffect } from 'react';
-import { GEO_SERVICES } from '../data/geospatialData';
-import { QuoteFormData, QuoteSubmissionResult } from '../types';
-import {
-  Send,
-  Upload,
-  CheckCircle2,
-  AlertCircle,
-  FileCode,
-  Layers,
-  Calendar,
-  Building,
-  User,
-  Mail,
-  DollarSign,
-  Compass,
-  Download,
-  Sparkles,
-  FileSpreadsheet,
-  Save,
-  Check
-} from 'lucide-react';
+import React, { useState } from 'react';
+import { AlertCircle, CheckCircle2, Send } from 'lucide-react';
+import { normalizeApiBase } from '../lib/api';
 
-import { saveQuoteRecord } from '../utils/storage';
+type FormValues = {
+  fullName: string;
+  email: string;
+  organization: string;
+  role: string;
+  projectType: string;
+  imageryType: string;
+  spatialResolution: string;
+  estimatedVolume: string;
+  timeline: string;
+  targetAccuracy: string;
+  budgetRange: string;
+  requirementsDescription: string;
+  acceptsTerms: boolean;
+};
 
-interface QuoteFormProps {
-  preselectedCategoryId?: string | null;
+type Receipt = { id: string; status: string; submittedAt: string };
+
+const env = (import.meta as ImportMeta & { env?: Record<string, string> }).env;
+const apiBase = env?.VITE_GEOLABEL_API_URL || 'http://localhost:8000';
+const initialValues: FormValues = {
+  fullName: '', email: '', organization: '', role: '',
+  projectType: 'custom-geospatial-task', imageryType: 'Not specified',
+  spatialResolution: 'Not specified', estimatedVolume: 'Not specified',
+  timeline: 'No preference', targetAccuracy: 'Not specified', budgetRange: 'No preference',
+  requirementsDescription: '', acceptsTerms: false,
+};
+
+async function parseResponse(response: Response) {
+  const raw = await response.text();
+  let payload: any = null;
+  try { payload = raw ? JSON.parse(raw) : null; } catch { /* Preserve plain response text below. */ }
+  if (!response.ok) {
+    const detail = payload?.detail || payload?.message || raw || response.statusText;
+    throw new Error(`HTTP ${response.status}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+  }
+  return payload;
 }
 
-const DRAFT_STORAGE_KEY = 'geolabel_quote_form_draft_v1';
+export const QuoteForm: React.FC = () => {
+  const [values, setValues] = useState<FormValues>(initialValues);
+  const [receipt, setReceipt] = useState<Receipt | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) => {
-  const [formData, setFormData] = useState<QuoteFormData>({
-    fullName: '',
-    email: '',
-    organization: '',
-    role: '',
-    projectType: preselectedCategoryId || 'ai-ml-training',
-    imageryType: 'Satellite RGB',
-    spatialResolution: 'Sub-meter (0.15m - 0.5m GSD)',
-    estimatedVolume: '10,000 km² / 50,000 Objects',
-    timeline: 'Standard (2-4 Weeks)',
-    targetAccuracy: '≥ 0.88 IoU SLA',
-    budgetRange: '$5,000 - $25,000',
-    hasSampleData: false,
-    sampleFileName: '',
-    requirementsDescription: '',
-    acceptsTerms: true
-  });
-
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
-  const [submissionResult, setSubmissionResult] = useState<QuoteSubmissionResult | null>(null);
-  const [dragActive, setDragActive] = useState<boolean>(false);
-  const [draftSavedToast, setDraftSavedToast] = useState<boolean>(false);
-  const [emailNotificationToast, setEmailNotificationToast] = useState<string | null>(null);
-
-  // Restore draft from localStorage on mount
-  useEffect(() => {
-    try {
-      const savedDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (savedDraft) {
-        const parsed = JSON.parse(savedDraft);
-        if (parsed && typeof parsed === 'object') {
-          setFormData(prev => ({
-            ...prev,
-            ...parsed,
-            projectType: preselectedCategoryId || parsed.projectType || 'ai-ml-training',
-          }));
-          setDraftSavedToast(true);
-          setTimeout(() => setDraftSavedToast(false), 4000);
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to restore quote draft from localStorage:', e);
-    }
-  }, [preselectedCategoryId]);
-
-  // Auto-save form inputs to localStorage as user types
-  useEffect(() => {
-    if (!submissionResult) {
-      try {
-        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(formData));
-      } catch (e) {
-        console.warn('Failed to save quote draft to localStorage:', e);
-      }
-    }
-  }, [formData, submissionResult]);
-
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
-    const { name, value, type } = e.target;
-    if (type === 'checkbox') {
-      const checked = (e.target as HTMLInputElement).checked;
-      setFormData(prev => ({ ...prev, [name]: checked }));
-    } else {
-      setFormData(prev => ({ ...prev, [name]: value }));
-    }
-
-    if (errors[name]) {
-      setErrors(prev => ({ ...prev, [name]: '' }));
-    }
+  const update = (field: keyof FormValues, value: string | boolean) => {
+    setValues((current) => ({ ...current, [field]: value }));
+    setError(null);
   };
 
-  const validateForm = (): boolean => {
-    const newErrors: Record<string, string> = {};
-
-    if (!formData.fullName.trim()) newErrors.fullName = 'Full name is required';
-    if (!formData.email.trim()) {
-      newErrors.email = 'Work email is required';
-    } else if (!/\S+@\S+\.\S+/.test(formData.email)) {
-      newErrors.email = 'Please enter a valid work email address';
-    }
-    if (!formData.organization.trim()) newErrors.organization = 'Company or Organization name is required';
-    if (!formData.requirementsDescription.trim()) newErrors.requirementsDescription = 'Please describe your annotation scope or requirements';
-
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      setFormData(prev => ({
-        ...prev,
-        hasSampleData: true,
-        sampleFileName: file.name
-      }));
-    }
-  };
-
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === 'dragenter' || e.type === 'dragover') {
-      setDragActive(true);
-    } else if (e.type === 'dragleave') {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      const file = e.dataTransfer.files[0];
-      setFormData(prev => ({
-        ...prev,
-        hasSampleData: true,
-        sampleFileName: file.name
-      }));
-    }
-  };
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (!validateForm()) return;
-
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError(null);
     setIsSubmitting(true);
-
-    // Simulate intake scoping engine response
-    setTimeout(() => {
-      const randomId = `GL-2026-${Math.floor(1000 + Math.random() * 9000)}`;
-      const result: QuoteSubmissionResult = {
-        ...formData,
-        quoteId: randomId,
-        submittedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' }),
-        estimatedHours: 85,
-        recommendedTeamSize: '3 Dedicated GIS Analysts + 1 Lead Auditor',
-        status: 'In Review'
-      };
-
-      console.log('Intake Form Submitted Successfully:', result);
-      console.log(`[MOCK EMAIL NOTIFICATION SERVICE] Confirmation dispatch sent to: ${formData.email} for Quote ID: ${randomId}`);
-      
-      saveQuoteRecord({
-        fullName: formData.fullName,
-        email: formData.email,
-        organization: formData.organization,
-        projectType: formData.projectType,
-        estimatedVolume: formData.estimatedVolume,
-        targetAccuracy: formData.targetAccuracy,
+    try {
+      const response = await fetch(`${normalizeApiBase(apiBase)}/quotes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          full_name: values.fullName,
+          email: values.email,
+          organization: values.organization,
+          role: values.role || null,
+          project_type: values.projectType,
+          imagery_type: values.imageryType,
+          spatial_resolution: values.spatialResolution,
+          estimated_volume: values.estimatedVolume,
+          timeline: values.timeline,
+          target_accuracy: values.targetAccuracy,
+          budget_range: values.budgetRange,
+          requirements_description: values.requirementsDescription,
+          accepts_terms: values.acceptsTerms,
+        }),
       });
-
-      // Clear auto-saved draft upon successful submission
-      try {
-        localStorage.removeItem(DRAFT_STORAGE_KEY);
-      } catch (e) {
-        console.warn('Failed to clear draft from localStorage:', e);
-      }
-
-      setEmailNotificationToast(`Mock Email Dispatched: Confirmation email sent to ${formData.email}!`);
-      setSubmissionResult(result);
+      const saved = await parseResponse(response);
+      setReceipt({ id: saved.id, status: saved.status, submittedAt: saved.submitted_at });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Unable to reach the configured GeoLabel API.');
+    } finally {
       setIsSubmitting(false);
-    }, 1200);
+    }
   };
 
-  const handleResetForm = () => {
-    setSubmissionResult(null);
-    setEmailNotificationToast(null);
-    setFormData(prev => ({
-      ...prev,
-      requirementsDescription: '',
-      hasSampleData: false,
-      sampleFileName: ''
-    }));
-  };
+  const startAnother = () => { setReceipt(null); setValues(initialValues); setError(null); };
+  const inputClass = 'mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2.5 text-sm text-white outline-none placeholder:text-slate-500 focus:border-teal-500';
+  const labelClass = 'block text-sm font-medium text-slate-300';
 
   return (
-    <section id="quote-section" className="py-20 bg-slate-900 border-b border-slate-800/80 relative">
-      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 space-y-10">
-        
-        {/* Toast Alerts */}
-        {emailNotificationToast && (
-          <div className="bg-emerald-950 border border-emerald-500 text-emerald-300 px-4 py-3 rounded-xl flex items-center justify-between text-xs font-mono shadow-lg animate-in fade-in slide-in-from-top-2">
-            <div className="flex items-center gap-2">
-              <Mail className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>{emailNotificationToast}</span>
-            </div>
-            <button
-              onClick={() => setEmailNotificationToast(null)}
-              className="text-emerald-400 hover:text-white ml-4 font-bold"
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        {draftSavedToast && !submissionResult && (
-          <div className="bg-teal-950/90 border border-teal-600 text-teal-300 px-3.5 py-2 rounded-xl flex items-center justify-between text-xs font-mono shadow-md animate-in fade-in">
-            <div className="flex items-center gap-2">
-              <Save className="w-3.5 h-3.5 text-teal-400 shrink-0" />
-              <span>Restored auto-saved quote request draft from your last session.</span>
-            </div>
-            <button
-              onClick={() => setDraftSavedToast(false)}
-              className="text-teal-400 hover:text-white font-bold text-sm"
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        {/* Section Header */}
-        <div className="text-center space-y-4">
-          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-teal-950/80 border border-teal-800/80 text-teal-300 text-xs font-mono">
-            <Send className="w-3.5 h-3.5 text-teal-400" />
-            <span>PROJECT SCOPING INTAKE</span>
-          </div>
-
-          <h2 className="text-2xl sm:text-3xl lg:text-4xl font-bold text-white tracking-tight">
-            Request a Geospatial Annotation Quote
-          </h2>
-
-          <p className="text-slate-300 text-sm sm:text-base leading-relaxed max-w-2xl mx-auto">
-            Provide your imagery volume, target coordinate system, and accuracy requirements. Our senior GIS lead will review your scope and respond with a formal pilot proposal within 12 hours.
-          </p>
+    <section id="quote-section" className="scroll-mt-24 border-t border-slate-800 bg-slate-900/50 py-20">
+      <div className="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8">
+        <div className="mb-8 max-w-2xl">
+          <div className="mb-3 inline-flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-teal-300"><Send className="h-4 w-4" /> Scoping request</div>
+          <h2 className="text-3xl font-bold tracking-tight text-white">Share your project requirements.</h2>
+          <p className="mt-3 text-sm leading-relaxed text-slate-300">Submitting this form stores your contact and project details in the configured database. This build does not calculate a price, send email, or guarantee a human follow-up. All volume, timeline, accuracy, and budget entries are request preferences only.</p>
         </div>
 
-        {/* Confirmation State Modal/Card after Submission */}
-        {submissionResult ? (
-          <div className="bg-slate-950 border border-teal-500/80 rounded-2xl p-6 sm:p-10 space-y-8 animate-in fade-in zoom-in-95 shadow-2xl">
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-slate-800 pb-6">
-              <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-xl bg-teal-950 border border-teal-600 flex items-center justify-center">
-                  <CheckCircle2 className="w-6 h-6 text-teal-400" />
-                </div>
-                <div>
-                  <span className="text-xs font-mono text-teal-400 uppercase tracking-wider">INTAKE SCOPING RECEIVED</span>
-                  <h3 className="text-xl font-bold text-white">Project Scope Confirmed</h3>
-                </div>
-              </div>
+        {error && <div role="alert" className="mb-5 flex items-start gap-2 rounded-xl border border-rose-800 bg-rose-950/40 p-4 text-sm text-rose-200"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}
 
-              <div className="bg-slate-900 border border-slate-800 px-4 py-2 rounded-lg font-mono text-xs text-right">
-                <span className="text-slate-400 block text-[10px]">REFERENCE ID</span>
-                <span className="text-teal-300 font-bold">{submissionResult.quoteId}</span>
-              </div>
-            </div>
-
-            {/* Submission Summary Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-xs font-mono">
-              <div className="bg-slate-900 p-3.5 rounded-lg border border-slate-800 space-y-1">
-                <span className="text-slate-500 block text-[10px]">CLIENT & ORGANIZATION</span>
-                <div className="text-white font-bold">{submissionResult.fullName}</div>
-                <div className="text-slate-400">{submissionResult.organization} ({submissionResult.role || 'Lead'})</div>
-              </div>
-
-              <div className="bg-slate-900 p-3.5 rounded-lg border border-slate-800 space-y-1">
-                <span className="text-slate-500 block text-[10px]">PROJECT CATEGORY</span>
-                <div className="text-teal-300 font-bold">
-                  {GEO_SERVICES.find(s => s.id === submissionResult.projectType)?.title || submissionResult.projectType}
-                </div>
-                <div className="text-slate-400">{submissionResult.imageryType}</div>
-              </div>
-
-              <div className="bg-slate-900 p-3.5 rounded-lg border border-slate-800 space-y-1">
-                <span className="text-slate-500 block text-[10px]">RECOMMENDED TEAM POD</span>
-                <div className="text-emerald-400 font-bold">{submissionResult.recommendedTeamSize}</div>
-                <div className="text-slate-400">Target SLA: {submissionResult.targetAccuracy}</div>
-              </div>
-            </div>
-
-            <div className="bg-slate-900 p-4 rounded-xl border border-slate-800 space-y-2">
-              <span className="text-xs font-mono text-teal-400 block uppercase">Requirements Brief</span>
-              <p className="text-xs text-slate-300 leading-relaxed font-mono italic">
-                "{submissionResult.requirementsDescription}"
-              </p>
-              {submissionResult.sampleFileName && (
-                <div className="text-[11px] font-mono text-slate-400 pt-1 flex items-center gap-1.5">
-                  <FileCode className="w-3.5 h-3.5 text-teal-400" />
-                  <span>Attached Sample File: {submissionResult.sampleFileName}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Next Steps Info */}
-            <div className="bg-teal-950/40 border border-teal-800/80 p-4 rounded-xl flex items-start gap-3 text-xs text-slate-300">
-              <Compass className="w-5 h-5 text-teal-400 shrink-0 mt-0.5" />
-              <div className="space-y-1">
-                <h4 className="font-bold text-white">What Happens Next?</h4>
-                <p className="text-slate-300 leading-relaxed">
-                  Our Senior GIS Lead will examine your sample schema and imagery. You will receive an email at <strong className="text-teal-300">{submissionResult.email}</strong> within 12 hours containing a preliminary pilot agreement, pricing tiers, and a calendar link to finalize your taxonomy.
-                </p>
-              </div>
-            </div>
-
-            <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
-              <button
-                onClick={handleResetForm}
-                className="w-full sm:w-auto px-5 py-2.5 text-xs font-mono font-semibold text-slate-300 hover:text-white bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors"
-              >
-                Submit Another Request
-              </button>
-
-              <div className="text-xs text-slate-400 font-mono">
-                Direct Contact: <a href="mailto:intake@geolabel.ai" className="text-teal-300 underline">intake@geolabel.ai</a>
-              </div>
-            </div>
-
+        {receipt ? (
+          <div className="rounded-2xl border border-emerald-800 bg-emerald-950/30 p-6 sm:p-8">
+            <div className="flex items-start gap-3"><CheckCircle2 className="mt-0.5 h-6 w-6 shrink-0 text-emerald-300" /><div>
+              <h3 className="text-lg font-semibold text-white">Request saved</h3>
+              <p className="mt-2 text-sm text-slate-300">The API returned a successful receipt. No other action is implied.</p>
+              <dl className="mt-5 grid gap-4 text-sm sm:grid-cols-2">
+                <div><dt className="text-slate-500">Reference</dt><dd className="mt-1 break-all font-mono text-emerald-200">{receipt.id}</dd></div>
+                <div><dt className="text-slate-500">Stored status</dt><dd className="mt-1 text-white">{receipt.status}</dd></div>
+                <div><dt className="text-slate-500">Server timestamp</dt><dd className="mt-1 text-white">{new Date(receipt.submittedAt).toLocaleString()}</dd></div>
+              </dl>
+              <button type="button" onClick={startAnother} className="mt-6 rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-slate-900">Submit another request</button>
+            </div></div>
           </div>
         ) : (
-          /* Intake Form */
-          <form
-            onSubmit={handleSubmit}
-            className="bg-slate-950 border border-slate-800 rounded-2xl p-6 sm:p-10 space-y-8 shadow-2xl"
-          >
-            {/* Auto-Save Status Bar */}
-            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-slate-900/90 px-4 py-2.5 rounded-xl border border-slate-800 text-xs font-mono gap-2">
-              <div className="flex items-center gap-2 text-teal-300 font-semibold">
-                <Save className="w-3.5 h-3.5 text-teal-400 shrink-0" />
-                <span>Auto-Save Enabled (localStorage)</span>
-              </div>
-              <span className="text-[11px] text-slate-400">
-                Your draft progress is continuously saved to your browser so you won't lose work.
-              </span>
-            </div>
-            
-            {/* Form Section 1: Contact & Organization */}
-            <div className="space-y-4">
-              <h3 className="text-base font-bold text-white border-b border-slate-800 pb-2 flex items-center gap-2">
-                <User className="w-4 h-4 text-teal-400" />
-                <span>1. Contact & Organization Details</span>
-              </h3>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Full Name <span className="text-teal-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    name="fullName"
-                    value={formData.fullName}
-                    onChange={handleChange}
-                    placeholder="e.g. Dr. Alex Chen"
-                    className={`w-full px-3.5 py-2.5 bg-slate-900 border rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500 ${
-                      errors.fullName ? 'border-red-500' : 'border-slate-800'
-                    }`}
-                  />
-                  {errors.fullName && <p className="text-[10px] text-red-400 mt-1">{errors.fullName}</p>}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Work Email Address <span className="text-teal-400">*</span>
-                  </label>
-                  <input
-                    type="email"
-                    name="email"
-                    value={formData.email}
-                    onChange={handleChange}
-                    placeholder="alex.chen@gis-ai.com"
-                    className={`w-full px-3.5 py-2.5 bg-slate-900 border rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500 ${
-                      errors.email ? 'border-red-500' : 'border-slate-800'
-                    }`}
-                  />
-                  {errors.email && <p className="text-[10px] text-red-400 mt-1">{errors.email}</p>}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Organization / Company <span className="text-teal-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    name="organization"
-                    value={formData.organization}
-                    onChange={handleChange}
-                    placeholder="e.g. Orbital Analytics Inc."
-                    className={`w-full px-3.5 py-2.5 bg-slate-900 border rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500 ${
-                      errors.organization ? 'border-red-500' : 'border-slate-800'
-                    }`}
-                  />
-                  {errors.organization && <p className="text-[10px] text-red-400 mt-1">{errors.organization}</p>}
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Role / Title
-                  </label>
-                  <input
-                    type="text"
-                    name="role"
-                    value={formData.role}
-                    onChange={handleChange}
-                    placeholder="e.g. Lead Computer Vision Engineer / GIS Director"
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500"
-                  />
-                </div>
-              </div>
+          <form onSubmit={submit} className="space-y-7 rounded-2xl border border-slate-800 bg-slate-950/70 p-5 shadow-xl sm:p-8">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className={labelClass}>Name<input required maxLength={160} value={values.fullName} onChange={(e) => update('fullName', e.target.value)} className={inputClass} placeholder="Your name" /></label>
+              <label className={labelClass}>Contact email<input required type="email" maxLength={320} value={values.email} onChange={(e) => update('email', e.target.value)} className={inputClass} placeholder="you@example.com" /></label>
+              <label className={labelClass}>Organization<input required maxLength={200} value={values.organization} onChange={(e) => update('organization', e.target.value)} className={inputClass} placeholder="Organization name" /></label>
+              <label className={labelClass}>Role (optional)<input maxLength={160} value={values.role} onChange={(e) => update('role', e.target.value)} className={inputClass} placeholder="Your role" /></label>
             </div>
 
-            {/* Form Section 2: Project Parameters */}
-            <div className="space-y-4">
-              <h3 className="text-base font-bold text-white border-b border-slate-800 pb-2 flex items-center gap-2">
-                <Layers className="w-4 h-4 text-teal-400" />
-                <span>2. Imagery & Annotation Scope</span>
-              </h3>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Project Service Category
-                  </label>
-                  <select
-                    name="projectType"
-                    value={formData.projectType}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-teal-500"
-                  >
-                    {GEO_SERVICES.map(s => (
-                      <option key={s.id} value={s.id}>
-                        {s.title}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Imagery Modality Source
-                  </label>
-                  <select
-                    name="imageryType"
-                    value={formData.imageryType}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-teal-500"
-                  >
-                    <option value="Satellite RGB">High-Res Satellite RGB (WorldView, PlanetScope)</option>
-                    <option value="Aerial / Drone RGB">Sub-Decimeter Aerial / Drone RGB</option>
-                    <option value="Multispectral">Multispectral (Sentinel-2, Landsat 8/9, Planet)</option>
-                    <option value="SAR Radar">Synthetic Aperture Radar (Sentinel-1 SAR)</option>
-                    <option value="LiDAR">LiDAR Point Cloud (.LAS / .LAZ)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Estimated Volume / Area
-                  </label>
-                  <input
-                    type="text"
-                    name="estimatedVolume"
-                    value={formData.estimatedVolume}
-                    onChange={handleChange}
-                    placeholder="e.g. 5,000 sq km / 25,000 buildings"
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Timeline SLA Target
-                  </label>
-                  <select
-                    name="timeline"
-                    value={formData.timeline}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-teal-500"
-                  >
-                    <option value="Rapid Emergency (48-72 Hours)">Rapid Emergency (48-72 Hours)</option>
-                    <option value="Standard (2-4 Weeks)">Standard Delivery (2-4 Weeks)</option>
-                    <option value="Ongoing Monthly Retainer">Ongoing Monthly Retainer / Stream</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Target Accuracy SLA
-                  </label>
-                  <select
-                    name="targetAccuracy"
-                    value={formData.targetAccuracy}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-teal-500"
-                  >
-                    <option value="≥ 0.88 IoU SLA">≥ 0.88 IoU SLA (Standard High Precision)</option>
-                    <option value="≥ 0.95 IoU SLA">≥ 0.95 IoU SLA (Defense / Sub-Pixel Critical)</option>
-                    <option value="Custom Taxonomy Agreement">Custom Taxonomy SLA Agreement</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-slate-300 mb-1">
-                    Budget Range (Optional)
-                  </label>
-                  <select
-                    name="budgetRange"
-                    value={formData.budgetRange}
-                    onChange={handleChange}
-                    className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-teal-500"
-                  >
-                    <option value="< $5,000">&lt; $5,000 (Pilot Batch)</option>
-                    <option value="$5,000 - $25,000">$5,000 - $25,000 (Standard Production)</option>
-                    <option value="$25,000 - $100,000">$25,000 - $100,000 (Large Scale Campaign)</option>
-                    <option value="> $100,000">&gt; $100,000 (Enterprise Retainer)</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            {/* Form Section 3: Detailed Description & Sample Upload */}
-            <div className="space-y-4">
-              <h3 className="text-base font-bold text-white border-b border-slate-800 pb-2 flex items-center gap-2">
-                <FileCode className="w-4 h-4 text-teal-400" />
-                <span>3. Specific Requirements & Sample Data</span>
-              </h3>
-
-              <div>
-                <label className="block text-xs font-mono text-slate-300 mb-1">
-                  Project Description & Taxonomy Guidelines <span className="text-teal-400">*</span>
-                </label>
-                <textarea
-                  name="requirementsDescription"
-                  rows={4}
-                  value={formData.requirementsDescription}
-                  onChange={handleChange}
-                  placeholder="Describe target classes, edge cases, requested coordinate system (e.g. EPSG:4326), output format (GeoJSON, COCO JSON, Shapefile), and any specific topological constraints..."
-                  className={`w-full px-3.5 py-2.5 bg-slate-900 border rounded-lg text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:border-teal-500 ${
-                    errors.requirementsDescription ? 'border-red-500' : 'border-slate-800'
-                  }`}
-                />
-                {errors.requirementsDescription && (
-                  <p className="text-[10px] text-red-400 mt-1">{errors.requirementsDescription}</p>
-                )}
-              </div>
-
-              {/* File Dropzone Mockup */}
-              <div>
-                <label className="block text-xs font-mono text-slate-300 mb-1">
-                  Sample Imagery / Spec Document (Optional)
-                </label>
-
-                <div
-                  onDragEnter={handleDrag}
-                  onDragLeave={handleDrag}
-                  onDragOver={handleDrag}
-                  onDrop={handleDrop}
-                  className={`border-2 border-dashed rounded-xl p-6 text-center transition-colors cursor-pointer ${
-                    dragActive
-                      ? 'border-teal-400 bg-teal-950/40'
-                      : formData.hasSampleData
-                      ? 'border-teal-600 bg-teal-950/20'
-                      : 'border-slate-800 bg-slate-900/60 hover:border-slate-700'
-                  }`}
-                >
-                  <input
-                    type="file"
-                    id="sample-upload"
-                    className="hidden"
-                    onChange={handleFileUpload}
-                    accept=".tiff,.geotiff,.geojson,.json,.png,.jpg,.zip,.pdf"
-                  />
-
-                  <label htmlFor="sample-upload" className="cursor-pointer space-y-2 block">
-                    <Upload className="w-8 h-8 text-teal-400 mx-auto" />
-                    {formData.hasSampleData ? (
-                      <div>
-                        <span className="text-xs font-mono text-teal-300 font-bold block">
-                          File Ready: {formData.sampleFileName}
-                        </span>
-                        <span className="text-[11px] text-slate-400">Click or drop another file to replace</span>
-                      </div>
-                    ) : (
-                      <div>
-                        <span className="text-xs font-mono text-slate-300 block font-semibold">
-                          Drag & drop sample image file, GeoJSON schema, or PDF specs
-                        </span>
-                        <span className="text-[10px] text-slate-500 font-mono block mt-1">
-                          Supports .GeoTIFF, .GeoJSON, .COCO, .ZIP (Max 50MB)
-                        </span>
-                      </div>
-                    )}
-                  </label>
-                </div>
-              </div>
-
-            </div>
-
-            {/* Terms & Submit Button */}
-            <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <label className="flex items-center gap-2 text-xs font-mono text-slate-400 cursor-pointer">
-                <input
-                  type="checkbox"
-                  name="acceptsTerms"
-                  checked={formData.acceptsTerms}
-                  onChange={handleChange}
-                  className="rounded border-slate-700 text-teal-600 focus:ring-teal-500 bg-slate-900"
-                />
-                <span>I agree to receive a technical scoping proposal and NDA</span>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className={labelClass}>Project type
+                <select value={values.projectType} onChange={(e) => update('projectType', e.target.value)} className={inputClass}>
+                  <option value="custom-geospatial-task">Custom geospatial task</option>
+                  <option value="building-footprints">Building footprints</option>
+                  <option value="transportation-network">Transportation network</option>
+                  <option value="land-cover-or-water">Land cover or water extent</option>
+                </select>
               </label>
-
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className="w-full sm:w-auto px-8 py-3.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-600 border border-teal-500/80 rounded-lg shadow-lg shadow-teal-950/50 transition-all flex items-center justify-center gap-2 group cursor-pointer disabled:opacity-50"
-              >
-                {isSubmitting ? (
-                  <>
-                    <span className="w-4 h-4 rounded-full border-2 border-white border-t-transparent animate-spin"></span>
-                    <span>Analyzing Scope...</span>
-                  </>
-                ) : (
-                  <>
-                    <span>Submit Scoping Request</span>
-                    <Send className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
-                  </>
-                )}
-              </button>
+              <label className={labelClass}>Imagery type
+                <select value={values.imageryType} onChange={(e) => update('imageryType', e.target.value)} className={inputClass}>
+                  <option>Not specified</option><option>Satellite optical</option><option>Aerial or drone</option><option>SAR</option><option>Other</option>
+                </select>
+              </label>
+              <label className={labelClass}>Ground sampling distance / resolution<input maxLength={120} value={values.spatialResolution} onChange={(e) => update('spatialResolution', e.target.value)} className={inputClass} placeholder="Optional preference" /></label>
+              <label className={labelClass}>Estimated volume<input maxLength={120} value={values.estimatedVolume} onChange={(e) => update('estimatedVolume', e.target.value)} className={inputClass} placeholder="Optional preference" /></label>
+              <label className={labelClass}>Desired timeline (preference)
+                <select value={values.timeline} onChange={(e) => update('timeline', e.target.value)} className={inputClass}>
+                  <option>No preference</option><option>Under 2 weeks</option><option>2–4 weeks</option><option>Flexible</option>
+                </select>
+              </label>
+              <label className={labelClass}>Target accuracy (preference, not a guarantee)<input maxLength={120} value={values.targetAccuracy} onChange={(e) => update('targetAccuracy', e.target.value)} className={inputClass} placeholder="Not specified" /></label>
+              <label className={`${labelClass} sm:col-span-2`}>Budget range (optional preference)
+                <select value={values.budgetRange} onChange={(e) => update('budgetRange', e.target.value)} className={inputClass}>
+                  <option>No preference</option><option>To be discussed</option><option>Under $5,000</option><option>$5,000–$25,000</option><option>Over $25,000</option>
+                </select>
+              </label>
             </div>
 
+            <label className={labelClass}>Project details<textarea required minLength={10} maxLength={10000} value={values.requirementsDescription} onChange={(e) => update('requirementsDescription', e.target.value)} rows={6} className={`${inputClass} resize-y`} placeholder="Describe the task, taxonomy, desired output, coordinate reference system, and constraints." /></label>
+            <div className="rounded-lg border border-amber-900/70 bg-amber-950/20 p-3 text-xs leading-relaxed text-amber-100/80">File uploads are not enabled. Do not include credentials, private imagery links, or sensitive data in the description.</div>
+            <label className="flex items-start gap-3 text-sm text-slate-300"><input type="checkbox" checked={values.acceptsTerms} onChange={(e) => update('acceptsTerms', e.target.checked)} className="mt-1 h-4 w-4 accent-teal-500" /><span>I consent to storing and using these contact and project details for this scoping request.</span></label>
+            <button type="submit" disabled={isSubmitting || !values.acceptsTerms} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-teal-600 px-5 py-3 font-semibold text-white transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-50">
+              <Send className="h-4 w-4" />{isSubmitting ? 'Saving request…' : 'Submit scoping request'}
+            </button>
           </form>
         )}
-
       </div>
     </section>
   );
