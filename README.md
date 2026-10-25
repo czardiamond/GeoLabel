@@ -129,6 +129,14 @@ npm run dev
 
 The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check; `/health/ready` checks the database and local storage write/read/delete readiness. Only `VITE_`-prefixed values are exposed to the browser. Never put the service key in a `VITE_` variable. User sessions are held in component memory and cleared on logout/page close.
 
+## API docs and task-creation troubleshooting
+
+Open `/docs` on the **FastAPI backend origin**, not on the Vercel frontend. The Vercel site is a separate frontend deployment; a 404 at its `/docs`, `/openapi.json`, or `/health` does not indicate a task API or authentication failure. Set the frontend build variable `VITE_GEOLABEL_API_URL` to the backend origin (without `/docs`) and add the exact frontend origin to backend `CORS_ORIGINS`. Never expose `GEOLABEL_API_KEY` in a `VITE_` variable.
+
+In Swagger's **Authorize** dialog, enter only the raw server-side `GEOLABEL_API_KEY`; Swagger adds the `Bearer` prefix. The HTTP header must be `Authorization: Bearer <server-key>`. Do not use a task-scoped `gl_ann_...` annotator key to create tasks. For direct `POST /tasks` REST requests, `raster_url` is the canonical JSON field; `raster_uri` is also accepted for compatibility with older examples. The Python SDK accepts either spelling and sends `raster_url` to the API. Task creation stores a URI reference and does not fetch or copy the raster.
+
+To verify the current backend, first run the read-only `bash scripts/verify-api.sh schema`, then run `bash scripts/verify-api.sh smoke` only against a disposable or staging service. The smoke command creates one clearly synthetic task, registers two task-scoped annotator keys, submits two identical tiny GeoJSON annotations, and checks the result; it does not download imagery. Those records remain in the selected database. The old `/tasks/{id}/simulate-completion` route is not part of the hardened backend; use the real annotation flow instead.
+
 ## Main API routes
 
 | Method | Route | Credential | Purpose |
