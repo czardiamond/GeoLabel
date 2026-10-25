@@ -47,6 +47,24 @@ def test_owner_endpoints_reject_short_service_secrets(api_client, monkeypatch):
     assert response.status_code == 503
 
 
+def test_task_creation_accepts_legacy_raster_uri_name(api_client):
+    client, _ = api_client
+    payload = {
+        "raster_uri": "s3://geolabel-smoke-test/example.tif",
+        "crs": "EPSG:4326",
+        "taxonomy": ["building_footprint"],
+        "target_annotator_count": 2,
+    }
+    response = client.post("/tasks", json=payload, headers=SERVICE_HEADERS)
+    assert response.status_code == 201, response.text
+    assert response.json()["raster_url"] == payload["raster_uri"]
+    assert response.json()["status"] == "queued"
+
+    conflicting = {**payload, "raster_url": "https://storage.example.test/other.tif"}
+    rejected = client.post("/tasks", json=conflicting, headers=SERVICE_HEADERS)
+    assert rejected.status_code == 422
+
+
 def test_task_lifecycle_and_task_bound_annotator_keys(api_client):
     client, session_factory = api_client
     preflight = client.options("/annotators/ann_example", headers={

@@ -13,6 +13,19 @@ class TaskCreate(BaseModel):
     target_annotator_count: int = Field(default=2, ge=1, le=10)
     webhook_url: Optional[HttpUrl] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_raster_uri(cls, value: Any) -> Any:
+        """Accept the SDK/older-docs name while keeping raster_url canonical."""
+        if not isinstance(value, dict) or "raster_uri" not in value:
+            return value
+        value = dict(value)
+        legacy_value = value.pop("raster_uri")
+        if "raster_url" in value and value["raster_url"] != legacy_value:
+            raise ValueError("Provide one matching raster_url or raster_uri value.")
+        value.setdefault("raster_url", legacy_value)
+        return value
+
     @field_validator("raster_url")
     @classmethod
     def validate_raster_uri(cls, value: str) -> str:
