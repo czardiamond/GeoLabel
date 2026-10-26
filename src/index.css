@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* Motion refresh: annotation focus and map workflow cues */
+@keyframes geolabel-reveal { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes geolabel-draw { from { stroke-dashoffset: 900; opacity: .35; } to { stroke-dashoffset: 0; opacity: 1; } }
+button, [role="button"], input, select, textarea { transition: transform 180ms cubic-bezier(.22,1,.36,1), box-shadow 180ms ease, background-color 180ms ease, border-color 180ms ease; }
+button:hover, [role="button"]:hover { transform: translateY(-1px); }
+button:active, [role="button"]:active { transform: translateY(0) scale(.98); }
+svg path, svg polyline, svg polygon { stroke-dasharray: 900; animation: geolabel-draw 800ms cubic-bezier(.22,1,.36,1) both; }
+[role="dialog"], .fixed.inset-0 > div, .rounded-xl, .rounded-2xl { animation: geolabel-reveal 360ms cubic-bezier(.22,1,.36,1) both; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
