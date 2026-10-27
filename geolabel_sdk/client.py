@@ -9,16 +9,16 @@ class GeoLabelClient:
     Official Python SDK Client for GeoLabel Specialist Annotation API.
     
     Usage:
-        client = GeoLabelClient(api_key="gl_live_...", base_url="https://your-deployed-app.up.railway.app")
+        client = GeoLabelClient(firebase_id_token="<verified-firebase-id-token>", base_url="https://your-deployed-app.example")
         task = client.tasks.create(raster_uri="s3://...", taxonomy=["building_footprint"])
         print(task.status())
         geojson = task.download_results(format="geojson")
     """
 
-    def __init__(self, api_key: str, base_url: str = "http://localhost:8000"):
-        if not api_key:
-            raise AuthenticationError("API key must be provided when initializing GeoLabelClient.")
-        self.api_key = api_key
+    def __init__(self, firebase_id_token: str, base_url: str = "http://localhost:8000"):
+        if not firebase_id_token:
+            raise AuthenticationError("A non-anonymous Firebase ID token is required when initializing GeoLabelClient.")
+        self.firebase_id_token = firebase_id_token
         self.base_url = base_url.rstrip("/")
 
         # Lazy import of TasksResource to avoid circular dependencies
@@ -40,7 +40,7 @@ class GeoLabelClient:
             url = f"{url}?{query_str}"
 
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.firebase_id_token}",
             "Content-Type": "application/json",
             "User-Agent": "GeoLabel-Python-SDK/1.0.0"
         }
@@ -55,7 +55,7 @@ class GeoLabelClient:
         except urllib.error.HTTPError as e:
             body_text = e.read().decode("utf-8") if e.fp else ""
             if e.code == 401:
-                raise AuthenticationError(f"Unauthorized: Invalid API key ({body_text})")
+                raise AuthenticationError(f"Unauthorized: Invalid or expired Firebase ID token ({body_text})")
             elif e.code == 404:
                 raise NotFoundError(f"Resource not found at {endpoint}: {body_text}")
             else:

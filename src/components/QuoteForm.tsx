@@ -27,7 +27,7 @@ interface QuoteFormProps {
   preselectedCategoryId?: string | null;
 }
 
-const DRAFT_STORAGE_KEY = 'geolabel_quote_form_draft_v1';
+const DRAFT_MEMORY_KEY = 'quote-form-draft';
 
 export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) => {
   const [formData, setFormData] = useState<QuoteFormData>({
@@ -55,12 +55,15 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
   const [draftSavedToast, setDraftSavedToast] = useState<boolean>(false);
   const [emailNotificationToast, setEmailNotificationToast] = useState<string | null>(null);
 
-  // Restore draft from localStorage on mount
+  // Restore the current user's draft after memory authentication and on account changes.
   useEffect(() => {
-    try {
-      const savedDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (savedDraft) {
-        const parsed = JSON.parse(savedDraft);
+    let cancelled = false;
+    const restore = async () => {
+      try {
+        await (window as any).projectMemoryReady;
+        const client = (window as any).projectMemory;
+        const parsed = client?.get(DRAFT_MEMORY_KEY);
+        if (!cancelled && parsed && typeof parsed === 'object') {
         if (parsed && typeof parsed === 'object') {
           setFormData(prev => ({
             ...prev,
@@ -71,20 +74,34 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
           setTimeout(() => setDraftSavedToast(false), 4000);
         }
       }
-    } catch (e) {
-      console.warn('Failed to restore quote draft from localStorage:', e);
-    }
+      } catch (e) {
+        console.warn('Failed to restore authenticated quote draft:', e);
+      }
+    };
+    restore();
+    window.addEventListener('project-memory-change', restore);
+    window.addEventListener('project-memory-ready', restore);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('project-memory-change', restore);
+      window.removeEventListener('project-memory-ready', restore);
+    };
   }, [preselectedCategoryId]);
 
-  // Auto-save form inputs to localStorage as user types
+  // Auto-save form inputs to the authenticated user's memory as they type.
   useEffect(() => {
-    if (!submissionResult) {
+    if (submissionResult) return;
+    const timer = window.setTimeout(async () => {
       try {
-        localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(formData));
+        await (window as any).projectMemoryReady;
+        const client = (window as any).projectMemory;
+        if (!client) throw new Error('Authenticated project memory is not configured');
+        await client.set(DRAFT_MEMORY_KEY, formData);
       } catch (e) {
-        console.warn('Failed to save quote draft to localStorage:', e);
+        console.warn('Failed to save authenticated quote draft:', e);
       }
-    }
+    }, 300);
+    return () => window.clearTimeout(timer);
   }, [formData, submissionResult]);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
@@ -152,7 +169,7 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!validateForm()) return;
@@ -160,7 +177,7 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
     setIsSubmitting(true);
 
     // Simulate intake scoping engine response
-    setTimeout(() => {
+    setTimeout(async () => {
       const randomId = `GL-2026-${Math.floor(1000 + Math.random() * 9000)}`;
       const result: QuoteSubmissionResult = {
         ...formData,
@@ -174,7 +191,8 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
       console.log('Intake Form Submitted Successfully:', result);
       console.log(`[MOCK EMAIL NOTIFICATION SERVICE] Confirmation dispatch sent to: ${formData.email} for Quote ID: ${randomId}`);
       
-      saveQuoteRecord({
+      try {
+      await saveQuoteRecord({
         fullName: formData.fullName,
         email: formData.email,
         organization: formData.organization,
@@ -182,12 +200,11 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
         estimatedVolume: formData.estimatedVolume,
         targetAccuracy: formData.targetAccuracy,
       });
-
-      // Clear auto-saved draft upon successful submission
-      try {
-        localStorage.removeItem(DRAFT_STORAGE_KEY);
-      } catch (e) {
-        console.warn('Failed to clear draft from localStorage:', e);
+      } catch (error) {
+        console.error('Authenticated save failed; not reporting success', error);
+        setIsSubmitting(false);
+        setEmailNotificationToast('Sign in is required before saving this quote.');
+        return;
       }
 
       setEmailNotificationToast(`Mock Email Dispatched: Confirmation email sent to ${formData.email}!`);
@@ -349,7 +366,7 @@ export const QuoteForm: React.FC<QuoteFormProps> = ({ preselectedCategoryId }) =
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between bg-slate-900/90 px-4 py-2.5 rounded-xl border border-slate-800 text-xs font-mono gap-2">
               <div className="flex items-center gap-2 text-teal-300 font-semibold">
                 <Save className="w-3.5 h-3.5 text-teal-400 shrink-0" />
-                <span>Auto-Save Enabled (localStorage)</span>
+                <span>Auto-Save Enabled (private memory)</span>
               </div>
               <span className="text-[11px] text-slate-400">
                 Your draft progress is continuously saved to your browser so you won't lose work.

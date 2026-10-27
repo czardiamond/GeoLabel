@@ -25,7 +25,7 @@ from geolabel_sdk import GeoLabelClient
 
 # Initialize client
 client = GeoLabelClient(
-    api_key="gl_live_secret_key_12345",
+    api_key="<verified-firebase-id-token>",
     base_url="http://localhost:8000"
 )
 
@@ -55,14 +55,14 @@ print(f"Downloaded {results['annotation_count']} vector feature collections!")
 
 ## ☁️ Deploying Backend to Railway or Render
 
-The backend relies on **SQLite by default** (simple, file-based, zero extra infrastructure) but uses SQLAlchemy ORM so you can swap in **PostgreSQL** anytime simply by supplying `DATABASE_URL=postgresql://user:pass@host/dbname`.
+Production requires durable PostgreSQL via `DATABASE_URL`; SQLite is available only for explicit local/test runs. Firebase ID-token verification requires `FIREBASE_PROJECT_ID`. See `SECURITY_AND_MEMORY.md` and `.env.example` for the required configuration and migration steps. This branch is not deployed.
 
 ### Option A: Railway Deployment
 1. Connect your GitHub repository to [Railway.app](https://railway.app).
 2. Railway auto-detects `railway.json` and `Procfile`.
 3. Set the following Environment Variables in Railway Dashboard:
-   - `GEOLABEL_API_KEY`: Set your secret bearer key (e.g. `gl_live_8923a1098b...`)
-   - `DATABASE_URL`: `sqlite:///./geolabel.db` (or attach a Railway Postgres database)
+   - `FIREBASE_PROJECT_ID`: Firebase project ID
+   - `DATABASE_URL`: durable PostgreSQL connection string
 4. Click **Deploy**. Your app will publish on `https://<your-app>.up.railway.app`.
 
 ### Option B: Render Deployment
@@ -73,8 +73,8 @@ The backend relies on **SQLite by default** (simple, file-based, zero extra infr
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn backend.main:app --host 0.0.0.0 --port $PORT`
 4. Set Environment Variables:
-   - `GEOLABEL_API_KEY`: Set your secret API key.
-   - `DATABASE_URL`: `sqlite:///./geolabel.db`
+   - `FIREBASE_PROJECT_ID`: Firebase project ID
+   - `DATABASE_URL`: durable PostgreSQL connection string
 5. Click **Create Web Service**. Your live backend URL will be `https://<your-service>.onrender.com`.
 
 ---
@@ -84,10 +84,10 @@ The backend relies on **SQLite by default** (simple, file-based, zero extra infr
 | Endpoint | Method | Description | Auth Header |
 | :--- | :--- | :--- | :--- |
 | `/health` | `GET` | Health check probe | None |
-| `/tasks` | `POST` | Ingest new annotation task | `Authorization: Bearer <key>` |
-| `/tasks/{id}` | `GET` | Retrieve task status & metadata | `Authorization: Bearer <key>` |
-| `/tasks/{id}/results` | `GET` | Download GeoJSON vectors + IAA score | `Authorization: Bearer <key>` |
-| `/tasks/{id}/webhook` | `POST` | Register callback webhook URL | `Authorization: Bearer <key>` |
+| `/tasks` | `POST` | Ingest task for authenticated owner | `Authorization: Bearer <Firebase ID token>` |
+| `/tasks/{id}` | `GET` | Retrieve owner-scoped task status | `Authorization: Bearer <Firebase ID token>` |
+| `/tasks/{id}/results` | `GET` | Download owner-scoped results | `Authorization: Bearer <Firebase ID token>` |
+| `/tasks/{id}/webhook` | `POST` | Register owner-scoped callback | `Authorization: Bearer <Firebase ID token>` |
 | `/tasks/{id}/annotations` | `POST` | Submit human specialist annotation | `Authorization: Bearer <key>` |
 | `/tasks/{id}/simulate-completion` | `POST` | End-to-end simulation helper | `Authorization: Bearer <key>` |
 

@@ -39,8 +39,9 @@ export const ProjectEstimator: React.FC<ProjectEstimatorProps> = ({ onApplyToQuo
     return `$${val.toLocaleString()}`;
   };
 
-  const handleSaveEstimate = () => {
-    savePodEstimateRecord({
+  const handleSaveEstimate = async () => {
+    try {
+    await savePodEstimateRecord({
       podSize,
       imageryType: `${resolutionGsd} (${objectDensity} density)`,
       areaKm2: areaSqKm,
@@ -49,6 +50,10 @@ export const ProjectEstimator: React.FC<ProjectEstimatorProps> = ({ onApplyToQuo
     });
     setSavedFeedback(true);
     setTimeout(() => setSavedFeedback(false), 2500);
+    } catch (error) {
+      console.error('Authenticated estimate save failed', error);
+      setSavedFeedback(false);
+    }
   };
 
   const handleTransferToQuote = () => {

@@ -636,14 +636,22 @@ export const InteractiveAnnotationStudio: React.FC = () => {
   }, [historyIndex, history, selectedPolyId, polygons, paintedGrid, userGridLabels]);
 
   // AUTO-SAVE & SESSION RECOVERY STORAGE HANDLERS
-  const AUTOSAVE_STORAGE_KEY = 'SAT_ANNOTATION_AUTOSAVE_CACHE_V2';
+  const AUTOSAVE_MEMORY_KEY = 'annotation-autosave';
+  const readAuthenticatedMemory = React.useCallback(async () => {
+    await (window as any).projectMemoryReady;
+    const client = (window as any).projectMemory;
+    if (!client) throw new Error('Authenticated project memory is not configured');
+    return client;
+  }, []);
 
-  // Restore Session on Mount
+  // Restore the current user's session on mount and whenever account state changes.
   React.useEffect(() => {
-    try {
-      const cached = localStorage.getItem(AUTOSAVE_STORAGE_KEY);
-      if (cached) {
-        const parsed = JSON.parse(cached);
+    let cancelled = false;
+    const restore = async () => {
+      try {
+        const client = await readAuthenticatedMemory();
+        const parsed = client.get(AUTOSAVE_MEMORY_KEY);
+        if (!cancelled && parsed && typeof parsed === 'object') {
         if (parsed && Array.isArray(parsed.polygons)) {
           setPolygons(parsed.polygons);
           if (parsed.crsMetadata) setCrsMetadata(parsed.crsMetadata);
@@ -658,15 +666,24 @@ export const InteractiveAnnotationStudio: React.FC = () => {
           setAutoSaveNotification('Session automatically restored from local cache');
           setTimeout(() => setAutoSaveNotification(null), 4000);
         }
+        }
+      } catch (err) {
+        console.error('Auto-save restoration failed:', err);
       }
-    } catch (err) {
-      console.error('Auto-save restoration failed:', err);
-    }
-  }, []);
+    };
+    restore();
+    window.addEventListener('project-memory-change', restore);
+    window.addEventListener('project-memory-ready', restore);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('project-memory-change', restore);
+      window.removeEventListener('project-memory-ready', restore);
+    };
+  }, [readAuthenticatedMemory]);
 
   // Debounced Auto-Save Writer
   React.useEffect(() => {
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       try {
         const payload = {
           polygons,
@@ -679,7 +696,8 @@ export const InteractiveAnnotationStudio: React.FC = () => {
           activeTaskType,
           timestamp: Date.now(),
         };
-        localStorage.setItem(AUTOSAVE_STORAGE_KEY, JSON.stringify(payload));
+        const client = await readAuthenticatedMemory();
+        await client.set(AUTOSAVE_MEMORY_KEY, payload);
         setLastAutoSavedAt(Date.now());
       } catch (e) {
         console.warn('Auto-save write error:', e);
@@ -687,11 +705,12 @@ export const InteractiveAnnotationStudio: React.FC = () => {
     }, 1000);
 
     return () => clearTimeout(timer);
-  }, [polygons, crsMetadata, mapBounds, paintedGrid, userGridLabels, tileQaStatus, selectedDemoIndex, activeTaskType]);
+  }, [polygons, crsMetadata, mapBounds, paintedGrid, userGridLabels, tileQaStatus, selectedDemoIndex, activeTaskType, readAuthenticatedMemory]);
 
-  const handleClearSavedSession = () => {
+  const handleClearSavedSession = async () => {
     try {
-      localStorage.removeItem(AUTOSAVE_STORAGE_KEY);
+      const client = await readAuthenticatedMemory();
+      await client.remove(AUTOSAVE_MEMORY_KEY);
       setPolygons([
         {
           id: 'poly-1',

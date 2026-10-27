@@ -1,22 +1,27 @@
 import os
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "GeoLabel Task Management API"
     VERSION: str = "1.0.0"
-    
-    # Database: Default to SQLite file database, easily overridden by postgresql://...
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./geolabel.db")
-    
-    # Basic API Key Authentication (Bearer token or X-API-Key header)
-    API_KEY: str = os.getenv("GEOLABEL_API_KEY", "gl_live_secret_key_12345")
-    
-    # Server settings
-    HOST: str = os.getenv("HOST", "0.0.0.0")
-    PORT: int = int(os.getenv("PORT", "8000"))
+    DATABASE_URL: str | None = None
+    FIREBASE_PROJECT_ID: str | None = None
+    GEOLABEL_ADMIN_SECRET: str | None = None
+    APP_ENV: str = "production"
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+    CORS_ORIGINS: str = ""
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def is_local_or_test(self) -> bool:
+        return self.APP_ENV.lower() in {"local", "dev", "development", "test"}
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [item.strip() for item in self.CORS_ORIGINS.split(",") if item.strip()]
+
 
 settings = Settings()

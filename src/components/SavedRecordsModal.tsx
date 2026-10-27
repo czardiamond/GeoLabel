@@ -13,17 +13,41 @@ export const SavedRecordsModal: React.FC<SavedRecordsModalProps> = ({ isOpen, on
   const [activeTab, setActiveTab] = useState<'quotes' | 'estimates'>('quotes');
 
   useEffect(() => {
-    if (isOpen) {
-      setQuotes(getSavedQuotes());
-      setEstimates(getSavedEstimates());
-    }
+    if (!isOpen) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        await (window as any).projectMemoryReady;
+        if (cancelled) return;
+        setQuotes(getSavedQuotes());
+        setEstimates(getSavedEstimates());
+      } catch (error) {
+        console.error('Authenticated memory load failed', error);
+        if (!cancelled) { setQuotes([]); setEstimates([]); }
+      }
+    };
+    load();
+    window.addEventListener('project-memory-change', load);
+    window.addEventListener('project-memory-ready', load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('project-memory-change', load);
+      window.removeEventListener('project-memory-ready', load);
+    };
   }, [isOpen]);
 
   if (!isOpen) return null;
 
-  const handleClearMemory = () => {
-    localStorage.removeItem('geolabel_saved_quotes_v1');
-    localStorage.removeItem('geolabel_saved_estimates_v1');
+  const handleClearMemory = async () => {
+    try {
+      await (window as any).projectMemoryReady;
+      const client = (window as any).projectMemory;
+      if (!client) throw new Error('Authenticated project memory is not configured');
+      await Promise.all([client.remove('quotes'), client.remove('estimates')]);
+    } catch (error) {
+      console.error('Authenticated memory clear failed', error);
+      return;
+    }
     setQuotes([]);
     setEstimates([]);
   };

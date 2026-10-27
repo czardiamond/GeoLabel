@@ -23,7 +23,7 @@ export const ApiPipelineExplorer: React.FC = () => {
 
   // Sandbox State
   const [customBaseUrl, setCustomBaseUrl] = useState<string>('http://localhost:8000');
-  const [customApiKey, setCustomApiKey] = useState<string>('gl_live_secret_key_12345');
+  const [customApiKey, setCustomApiKey] = useState<string>('');
   const [sampleRasterUrl, setSampleRasterUrl] = useState<string>('s3://earth-observation-data/sentinel2_tile_34T.tif');
   const [crsProjection, setCrsProjection] = useState<string>('EPSG:32634');
   const [targetAnnotatorCount, setTargetAnnotatorCount] = useState<number>(2);
@@ -38,7 +38,7 @@ export const ApiPipelineExplorer: React.FC = () => {
 
 from geolabel_sdk import GeoLabelClient
 
-# Initialize client with API key and deployed FastAPI base URL
+# Initialize client with a verified Firebase ID token and deployed FastAPI base URL
 client = GeoLabelClient(
     api_key="${customApiKey}",
     base_url="${customBaseUrl}"
@@ -136,8 +136,9 @@ def get_task_results(task_id: str, db: Session = Depends(get_db)):
   const deployInstructionsSnippet = `# Railway & Render Deployment Configuration Guide
 
 ## Environment Variables Required:
-GEOLABEL_API_KEY=gl_live_secret_key_12345
-DATABASE_URL=sqlite:///./geolabel.db  # (Or postgresql://user:pass@host:5432/geolabel)
+FIREBASE_PROJECT_ID=your-firebase-project-id
+DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST/DBNAME
+GEOLABEL_ADMIN_SECRET=replace-with-a-long-random-secret
 
 ## Procfile (Included in Root):
 web: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
