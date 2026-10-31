@@ -15,3 +15,7 @@ This folder is the root of a separate Vercel project. It exposes only the MCP St
 Use the active feature-branch Preview hostname with `/mcp` as the MCP URL and supply the bearer key in the client’s Authorization header. Vercel creates the final hostname after the first Preview deployment.
 
 This private Preview uses a high-entropy static bearer key for client compatibility. It is not a full OAuth 2.1 authorization server. Before any public or Production release, replace this with a standards-compliant OAuth 2.1 flow and revisit deployment protection, key rotation, rate limits, and operational monitoring.
+
+## Preview-only deployment guard
+
+The Vercel project’s ignored-build command permits only `VERCEL_ENV=preview` on `cue/geolabel-verified-workflows`. The app also returns HTTP 503 in every other Vercel environment, even if a bearer key is accidentally supplied there. For API-driven deployments use Vercel’s explicit `staging` target (its Preview target); an omitted target on a new project can be auto-promoted by Vercel and must not be used.

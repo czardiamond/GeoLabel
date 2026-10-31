@@ -110,3 +110,14 @@ def test_remote_project_exposes_no_web_docs_or_other_public_routes():
     assert root.status_code == 404
     assert docs.status_code == 404
     assert schema.status_code == 404
+
+
+def test_remote_mcp_is_disabled_outside_vercel_preview(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("VERCEL_ENV", "production")
+    app = create_app(api_key=TOKEN, allowed_hosts=["127.0.0.1"])
+    headers = {**HEADERS, "Authorization": f"Bearer {TOKEN}"}
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post("/mcp", json=INITIALIZE, headers=headers)
+    assert response.status_code == 503
+    assert "only in Preview" in response.json()["error"]

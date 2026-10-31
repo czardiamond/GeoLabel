@@ -57,6 +57,10 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        if os.environ.get("VERCEL") == "1" and os.environ.get("VERCEL_ENV") != "preview":
+            await self._respond(send, 503, {"error": "Remote MCP is enabled only in Preview"})
+            return
+
         token = self.expected_token
         if not token or len(token) < MIN_API_KEY_LENGTH or token.strip() != token:
             await self._respond(send, 503, {"error": "MCP bearer authentication is not configured"})
