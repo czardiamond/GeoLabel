@@ -1,7 +1,7 @@
 from functools import cached_property
 from typing import Optional
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def select_postgresql_driver(cls, value):
+        # SQLAlchemy's default PostgreSQL driver can change across releases.
+        # Keep standard provider URLs bound to the driver in requirements.txt.
+        if isinstance(value, str):
+            for prefix in ("postgres://", "postgresql://"):
+                if value.startswith(prefix):
+                    return "postgresql+psycopg2://" + value[len(prefix):]
+        return value
 
     @cached_property
     def cors_origin_list(self) -> list[str]:
