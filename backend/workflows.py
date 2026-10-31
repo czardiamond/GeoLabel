@@ -10,7 +10,7 @@ import socket
 import tempfile
 import uuid
 import zipfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,8 +23,10 @@ from pydantic import BaseModel, Field, HttpUrl, ValidationError, field_validator
 import pyproj
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from backend.asset_storage import (
+    delete_storage_key,
     inspect_and_preview,
     make_storage_paths,
     new_temp_path,
@@ -34,11 +36,18 @@ from backend.asset_storage import (
     save_temp_asset,
     storage_root,
 )
+from backend.blob_storage import (
+    download_to_path as download_blob_to_path,
+    head_file as head_blob_file,
+    is_configured as blob_storage_configured,
+    key_from_pathname,
+)
 from backend.gis_operations import raster_band_statistics, raster_change_analysis, spatial_join
 from backend.mask_utils import polygonize_png_mask
 from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
+from backend.temp_storage import reserve_download
 from backend.geo_utils import reproject_feature_collection
 from backend.geo_validation import validate_geojson_collection
 from backend.inference import (
@@ -65,6 +74,7 @@ from backend.models import (
     TaskComment,
     UserAccount,
     UserNotification,
+    UploadIntent,
     VideoSegmentSubmission,
     utcnow_naive,
 )
@@ -104,6 +114,64 @@ class RemoteAssetImport(BaseModel):
             if value[0] >= value[2] or value[1] >= value[3]:
                 raise ValueError("bounds must have xmin < xmax and ymin < ymax")
         return value
+
+
+class AssetUploadIntent(BaseModel):
+    asset_id: str = Field(pattern=r"^asset_[0-9a-f]{32}$")
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=120)
+    size_bytes: int = Field(gt=0)
+
+
+class AssetUploadFinalize(AssetUploadIntent):
+    pathname: str = Field(min_length=1, max_length=1024)
+    crs: str | None = Field(default=None, max_length=256)
+    bounds: str | None = Field(default=None, max_length=512)
+    world_file: str | None = Field(default=None, max_length=4096)
+
+
+class AssetUploadCancel(AssetUploadIntent):
+    pathname: str = Field(min_length=1, max_length=1024)
+
+
+DIRECT_UPLOAD_CONTENT_TYPES = {
+    "application/octet-stream", "image/tiff", "image/geotiff", "image/png", "image/jpeg",
+    "image/webp", "image/bmp", "video/mp4", "video/webm", "video/quicktime",
+}
+
+
+def _direct_upload_path(organization_id: str, dataset_id: str, payload: AssetUploadIntent) -> str:
+    return f"geolabel/{organization_id}/{dataset_id}/{payload.asset_id}/original_{safe_filename(payload.filename)}"
+
+
+def _validate_direct_upload(payload: AssetUploadIntent) -> tuple[str, int]:
+    content_type = payload.content_type.lower().split(";", 1)[0].strip()
+    if content_type not in DIRECT_UPLOAD_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="Supported uploads are GeoTIFF, PNG, JPEG, WebP, BMP, MP4, WebM, and MOV.")
+    maximum = _asset_upload_limit_bytes()
+    if payload.size_bytes > maximum:
+        raise HTTPException(status_code=413, detail=f"Asset exceeds the {maximum // (1024 * 1024)} MiB processing limit.")
+    return content_type, maximum
+
+
+UPLOAD_INTENT_TTL = timedelta(hours=1)
+VERCEL_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _asset_upload_limit_bytes() -> int:
+    configured = max(1, settings.MAX_ASSET_UPLOAD_MB) * 1024 * 1024
+    return min(configured, VERCEL_MAX_BYTES) if os.getenv("VERCEL") == "1" else configured
+
+
+def _intent_expired(intent: UploadIntent) -> bool:
+    return intent.expires_at <= utcnow_naive()
+
+
+def _assert_intent_payload(intent: UploadIntent, payload: AssetUploadIntent) -> None:
+    if (intent.asset_id != payload.asset_id or intent.declared_filename != payload.filename
+            or intent.declared_content_type != payload.content_type.lower().split(";", 1)[0].strip()
+            or intent.declared_size_bytes != payload.size_bytes):
+        raise HTTPException(status_code=409, detail="Upload metadata does not match its authorized intent.")
 
 
 class TaskCreateInProject(BaseModel):
@@ -422,14 +490,15 @@ def _require_asset_assignment(asset: Asset, membership: OrganizationMembership, 
 
 
 def _asset_response(asset: Asset) -> dict:
+    prefix = "/api" if os.getenv("VERCEL") == "1" else ""
     return {
         "id": asset.id, "dataset_id": asset.dataset_id, "filename": asset.original_filename,
         "content_type": asset.content_type, "kind": asset.kind, "size_bytes": asset.size_bytes,
         "width": asset.width, "height": asset.height, "crs": asset.crs, "bounds": asset.bounds,
         "metadata": asset.asset_metadata,
         "created_at": asset.created_at,
-        "preview_path": f"/assets/{asset.id}/preview" if asset.preview_key else None,
-        "content_path": f"/assets/{asset.id}/content",
+        "preview_path": f"{prefix}/assets/{asset.id}/preview" if asset.preview_key else None,
+        "content_path": f"{prefix}/assets/{asset.id}/content",
     }
 
 
@@ -682,16 +751,22 @@ def list_datasets(project_id: str, member: MemberContext = Depends(require_membe
     return [{"id": item.id, "project_id": item.project_id, "name": item.name, "description": item.description, "created_at": item.created_at} for item in rows]
 
 
-async def _store_upload(dataset: Dataset, project: Project, filename: str, content_type: str, source: Path, size: int, crs: str | None, bounds: str | None, member: MemberContext, db: Session, world_file_value: str | None = None) -> Asset:
+async def _store_upload(dataset: Dataset, project: Project, filename: str, content_type: str, source: Path, size: int, crs: str | None, bounds: str | None, member: MemberContext, db: Session, world_file_value: str | None = None, storage_key_override: str | None = None, asset_id_override: str | None = None, upload_intent: UploadIntent | None = None) -> Asset:
     if size <= 0:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
     try:
-        metadata = inspect_and_preview(source, filename, content_type, crs, bounds, world_file_value)
+        metadata = await asyncio.to_thread(inspect_and_preview, source, filename, content_type, crs, bounds, world_file_value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    asset_id = f"asset_{uuid.uuid4().hex[:16]}"
+    asset_id = asset_id_override or f"asset_{uuid.uuid4().hex[:16]}"
+    storage_key = None
+    preview_key = None
+    committed = False
     try:
-        storage_key, preview_key = save_temp_asset(source, project.organization_id, asset_id, filename, metadata["preview_path"])
+        storage_key, preview_key = await asyncio.to_thread(
+            save_temp_asset, source, project.organization_id, asset_id, filename,
+            metadata["preview_path"], metadata["content_type"], storage_key_override,
+        )
         asset = Asset(
             id=asset_id, dataset_id=dataset.id, original_filename=safe_filename(filename),
             storage_key=storage_key, preview_key=preview_key, content_type=metadata["content_type"],
@@ -700,15 +775,161 @@ async def _store_upload(dataset: Dataset, project: Project, filename: str, conte
             metadata_json=json.dumps(metadata["metadata"]),
         )
         db.add(asset)
+        if upload_intent is not None:
+            upload_intent.status = "finalized"
         audit(db, project.organization_id, member.user_id, "asset.ingested", "asset", asset.id,
               {"filename": asset.original_filename, "kind": asset.kind, "size_bytes": size})
         db.commit()
+        committed = True
         db.refresh(asset)
         return asset
     except Exception:
-        parent = storage_root() / project.organization_id / asset_id
-        shutil.rmtree(parent, ignore_errors=True)
+        if not committed:
+            db.rollback()
+            keys = [key for key in (storage_key, preview_key) if key and key != storage_key_override]
+            referenced = {row[0] for row in db.query(Asset.storage_key).filter(Asset.storage_key.in_(keys)).all()}
+            referenced.update(row[0] for row in db.query(Asset.preview_key).filter(Asset.preview_key.in_(keys)).all())
+            for key in keys:
+                try:
+                    if key not in referenced:
+                        delete_storage_key(key)
+                except Exception:
+                    pass
+            parent = storage_root() / project.organization_id / asset_id
+            shutil.rmtree(parent, ignore_errors=True)
         raise
+
+
+@router.post("/datasets/{dataset_id}/assets/upload-authorize")
+def authorize_direct_asset_upload(dataset_id: str, payload: AssetUploadIntent,
+                                  member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    if not blob_storage_configured():
+        raise HTTPException(status_code=503, detail="Direct uploads require private Blob storage to be configured.")
+    dataset, project = _dataset_for_member(db, dataset_id, member)
+    membership = membership_for(db, member.user_id, project.organization_id)
+    _can_edit(membership.role)
+    content_type, maximum = _validate_direct_upload(payload)
+    pathname = _direct_upload_path(project.organization_id, dataset.id, payload)
+    now = utcnow_naive()
+    intent = db.query(UploadIntent).filter(UploadIntent.asset_id == payload.asset_id).with_for_update().first()
+    if db.query(Asset).filter(Asset.id == payload.asset_id).first():
+        raise HTTPException(status_code=409, detail="This asset ID has already been finalized.")
+    if intent is not None:
+        if intent.creator_user_id != member.user_id:
+            raise HTTPException(status_code=403, detail="This upload intent belongs to another user.")
+        if intent.status != "pending" or _intent_expired(intent):
+            raise HTTPException(status_code=409, detail="This upload intent is no longer active; start a new upload with a new asset ID.")
+        if intent.dataset_id != dataset.id or intent.pathname != pathname:
+            raise HTTPException(status_code=409, detail="Upload intent belongs to a different dataset or path.")
+        _assert_intent_payload(intent, payload)
+        db.commit()
+    else:
+        intent = UploadIntent(asset_id=payload.asset_id, pathname=pathname, dataset_id=dataset.id,
+                              creator_user_id=member.user_id, declared_filename=payload.filename,
+                              declared_content_type=content_type, declared_size_bytes=payload.size_bytes,
+                              status="pending", created_at=now, expires_at=now + UPLOAD_INTENT_TTL)
+        db.add(intent)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="This upload ID was authorized concurrently; retry or use a new asset ID.") from exc
+    valid_until_ms = int(intent.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    return {
+        "asset_id": payload.asset_id,
+        "pathname": intent.pathname,
+        "content_type": content_type,
+        "maximum_size_bytes": min(payload.size_bytes, maximum),
+        "allowed_content_types": sorted(DIRECT_UPLOAD_CONTENT_TYPES),
+        "intent_id": intent.id,
+        "expires_at": intent.expires_at,
+        "valid_until_ms": valid_until_ms,
+    }
+
+
+@router.post("/datasets/{dataset_id}/assets/finalize", status_code=status.HTTP_201_CREATED)
+async def finalize_direct_asset_upload(dataset_id: str, payload: AssetUploadFinalize,
+                                      member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    if not blob_storage_configured():
+        raise HTTPException(status_code=503, detail="Private Blob storage is not configured.")
+    dataset, project = _dataset_for_member(db, dataset_id, member)
+    membership = membership_for(db, member.user_id, project.organization_id)
+    _can_edit(membership.role)
+    content_type, _ = _validate_direct_upload(payload)
+    expected_pathname = _direct_upload_path(project.organization_id, dataset.id, payload)
+    if payload.pathname != expected_pathname:
+        raise HTTPException(status_code=400, detail="Uploaded object path does not match its authorized dataset and asset.")
+    intent = db.query(UploadIntent).filter(UploadIntent.asset_id == payload.asset_id).with_for_update().first()
+    if intent is None or intent.dataset_id != dataset.id or intent.creator_user_id != member.user_id:
+        raise HTTPException(status_code=403, detail="Upload intent is not authorized for this user and dataset.")
+    _assert_intent_payload(intent, payload)
+    if intent.status == "finalized" or db.query(Asset).filter(Asset.id == payload.asset_id).first():
+        raise HTTPException(status_code=409, detail="This asset ID has already been finalized.")
+    if intent.status != "pending" or _intent_expired(intent):
+        if intent.status == "pending":
+            intent.status = "expired"
+            db.commit()
+        raise HTTPException(status_code=410, detail="The upload intent has expired or is no longer active.")
+    if intent.pathname != expected_pathname:
+        raise HTTPException(status_code=400, detail="Uploaded object path does not match its authorized dataset and asset.")
+    storage_key = key_from_pathname(payload.pathname)
+    try:
+        metadata = await asyncio.to_thread(head_blob_file, storage_key)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Uploaded private object was not found or could not be verified.") from exc
+    if metadata.pathname != expected_pathname or metadata.size != payload.size_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded object metadata does not match the authorized upload.")
+    actual_content_type = (metadata.content_type or content_type).lower().split(";", 1)[0].strip()
+    if actual_content_type not in DIRECT_UPLOAD_CONTENT_TYPES:
+        raise HTTPException(status_code=415, detail="Uploaded object content type is not supported.")
+
+    temp_path = new_temp_path()
+    try:
+        await asyncio.to_thread(download_blob_to_path, storage_key, temp_path)
+        if temp_path.stat().st_size != metadata.size:
+            raise HTTPException(status_code=503, detail="Private asset storage returned an incomplete object.")
+        asset = await _store_upload(
+            dataset, project, payload.filename, actual_content_type, temp_path, metadata.size,
+            payload.crs, payload.bounds, member, db, payload.world_file, storage_key, payload.asset_id, intent,
+        )
+        return _asset_response(asset)
+    except HTTPException:
+        raise
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+@router.post("/datasets/{dataset_id}/assets/cancel-upload")
+async def cancel_direct_asset_upload(dataset_id: str, payload: AssetUploadCancel,
+                                     member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    if not blob_storage_configured():
+        raise HTTPException(status_code=503, detail="Private Blob storage is not configured.")
+    dataset, project = _dataset_for_member(db, dataset_id, member)
+    membership = membership_for(db, member.user_id, project.organization_id)
+    _can_edit(membership.role)
+    _validate_direct_upload(payload)
+    expected_pathname = _direct_upload_path(project.organization_id, dataset.id, payload)
+    if payload.pathname != expected_pathname:
+        raise HTTPException(status_code=400, detail="Uploaded object path does not match its authorized dataset and asset.")
+    intent = db.query(UploadIntent).filter(UploadIntent.asset_id == payload.asset_id).with_for_update().first()
+    if intent is None or intent.dataset_id != dataset.id or intent.creator_user_id != member.user_id:
+        raise HTTPException(status_code=403, detail="Upload intent is not authorized for this user and dataset.")
+    _assert_intent_payload(intent, payload)
+    if intent.status != "pending" or _intent_expired(intent) or db.query(Asset).filter(Asset.id == payload.asset_id).first():
+        if intent.status == "pending" and _intent_expired(intent):
+            intent.status = "expired"
+            db.commit()
+        raise HTTPException(status_code=409, detail="A finalized asset cannot be cancelled.")
+    try:
+        await asyncio.to_thread(delete_storage_key, key_from_pathname(payload.pathname))
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="The temporary private upload could not be removed.") from exc
+    intent.status = "cancelled"
+    audit(db, project.organization_id, member.user_id, "asset.upload.discarded", "dataset", dataset.id,
+          {"asset_id": payload.asset_id})
+    db.commit()
+    return {"status": "discarded"}
 
 
 @router.post("/datasets/{dataset_id}/assets", status_code=status.HTTP_201_CREATED)
@@ -724,7 +945,7 @@ async def upload_asset(
     dataset, project = _dataset_for_member(db, dataset_id, member)
     membership = membership_for(db, member.user_id, project.organization_id)
     _can_edit(membership.role)
-    max_bytes = max(1, settings.MAX_ASSET_UPLOAD_MB) * 1024 * 1024
+    max_bytes = _asset_upload_limit_bytes()
     temp_path = new_temp_path()
     size = 0
     world_file_value = None
@@ -735,6 +956,7 @@ async def upload_asset(
                 if not block:
                     break
                 size += len(block)
+                reserve_download(temp_path, size)
                 if size > max_bytes:
                     raise HTTPException(status_code=413, detail=f"Asset exceeds the {settings.MAX_ASSET_UPLOAD_MB} MB configured upload limit.")
                 target.write(block)
@@ -765,7 +987,7 @@ async def import_remote_asset(dataset_id: str, payload: RemoteAssetImport, membe
     _validate_remote_url(payload.url)
     temp_path = new_temp_path()
     total = 0
-    max_bytes = max(1, settings.MAX_ASSET_UPLOAD_MB) * 1024 * 1024
+    max_bytes = _asset_upload_limit_bytes()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0), follow_redirects=False, trust_env=False) as client:
             async with client.stream("GET", payload.url, headers={"Accept": "image/*,video/mp4,video/webm,video/quicktime"}) as response:
@@ -777,6 +999,7 @@ async def import_remote_asset(dataset_id: str, payload: RemoteAssetImport, membe
                 with temp_path.open("wb") as target:
                     async for block in response.aiter_bytes(1024 * 1024):
                         total += len(block)
+                        reserve_download(temp_path, total)
                         if total > max_bytes:
                             raise HTTPException(status_code=413, detail=f"Remote asset exceeds the {settings.MAX_ASSET_UPLOAD_MB} MB configured limit.")
                         target.write(block)
@@ -1778,7 +2001,8 @@ def export_organization(organization_id: str, member: MemberContext = Depends(re
     }
     manifest_bytes = json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     uncompressed_bytes += len(manifest_bytes)
-    limit_bytes = max(1, settings.MAX_ORGANIZATION_EXPORT_MB) * 1024 * 1024
+    configured_export_limit = max(1, settings.MAX_ORGANIZATION_EXPORT_MB) * 1024 * 1024
+    limit_bytes = min(configured_export_limit, VERCEL_MAX_BYTES) if os.getenv("VERCEL") == "1" else configured_export_limit
     if uncompressed_bytes > limit_bytes:
         raise HTTPException(status_code=413, detail=f"Organization export exceeds the configured {max(1, settings.MAX_ORGANIZATION_EXPORT_MB)} MB uncompressed-size limit.")
 

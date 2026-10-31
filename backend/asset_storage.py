@@ -7,6 +7,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import hashlib
+import threading
+import warnings
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,14 +18,23 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 import pyproj
 
 from backend.config import settings
+from backend.temp_storage import current_asset_scope
+from backend.blob_storage import delete_key as delete_blob_key, download_to_path, is_blob_key, is_configured as blob_storage_configured, put_file as put_blob_file
 
 IMAGE_TYPES = {"image/tiff", "image/geotiff", "image/png", "image/jpeg", "image/webp", "image/bmp"}
 VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime"}
 MAX_PREVIEW_EDGE = 1600
+MAX_IMAGE_PIXELS = 40_000_000
+MAX_IMAGE_EDGE = 32_768
+_materialization_lock = threading.RLock()
 
 
 def storage_root() -> Path:
-    root = Path(settings.ASSET_STORAGE_DIR).expanduser().resolve()
+    if blob_storage_configured():
+        scope = current_asset_scope()
+        root = scope.root if scope is not None else Path(tempfile.gettempdir()) / "geolabel-scratch"
+    else:
+        root = Path(settings.ASSET_STORAGE_DIR).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -197,14 +209,21 @@ def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value:
                 "metadata": {"driver": "GeoTIFF", "bands": "raster", "affine_transform": affine_transform}}
 
     try:
-        with Image.open(path) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGB")
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                raise ValueError("The image has invalid dimensions")
-            image.thumbnail((MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE), Image.Resampling.LANCZOS)
-            image.save(preview_path, format="PNG", optimize=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as opened:
+                width, height = opened.size
+                if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS or max(width, height) > MAX_IMAGE_EDGE:
+                    raise ValueError("Ordinary images are limited to 40 million pixels and a 32,768-pixel edge; use a geospatial raster workflow for larger imagery.")
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                width, height = image.size
+                image.thumbnail((MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE), Image.Resampling.LANCZOS)
+                image.save(preview_path, format="PNG", optimize=True)
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        preview_path.unlink(missing_ok=True)
+        raise ValueError("The image exceeds the safe decoded-pixel limit.") from exc
     except (UnidentifiedImageError, OSError) as exc:
+        preview_path.unlink(missing_ok=True)
         raise ValueError("The upload is not a readable image") from exc
     world_bounds = None
     world_coefficients = None
@@ -241,6 +260,18 @@ def make_storage_paths(organization_id: str, asset_id: str, filename: str) -> tu
 
 
 def resolve_storage_key(key: str) -> Path:
+    if is_blob_key(key):
+        scope = current_asset_scope()
+        # A scope is unique to one HTTP request and survives until streaming ends.
+        # Standalone callers own cleanup of their scratch directory.
+        lock = scope.lock if scope is not None else _materialization_lock
+        with lock:
+            materialized = storage_root() / ".blob-materialized"
+            materialized.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = materialized / hashlib.sha256(key.encode("utf-8")).hexdigest()
+            if not path.is_file():
+                download_to_path(key, path)
+            return path
     root = storage_root()
     path = (root / key).resolve()
     if root != path and root not in path.parents:
@@ -248,7 +279,41 @@ def resolve_storage_key(key: str) -> Path:
     return path
 
 
-def save_temp_asset(source: Path, organization_id: str, asset_id: str, filename: str, preview_path: Path | None) -> tuple[str, str | None]:
+def save_temp_asset(source: Path, organization_id: str, asset_id: str, filename: str, preview_path: Path | None,
+                    content_type: str = "application/octet-stream", storage_key_override: str | None = None) -> tuple[str, str | None]:
+    if storage_key_override is not None:
+        if not blob_storage_configured() or not is_blob_key(storage_key_override):
+            raise ValueError("An existing Blob key can only be used with configured private Blob storage")
+        preview_key = None
+        if preview_path and preview_path.exists():
+            preview_key = put_blob_file(f"geolabel/{organization_id}/{asset_id}/preview_{uuid.uuid4().hex}.png", preview_path, "image/png")
+            preview_path.unlink(missing_ok=True)
+        return storage_key_override, preview_key
+
+    if blob_storage_configured():
+        storage_key = None
+        preview_key = None
+        try:
+            storage_key = put_blob_file(
+                f"geolabel/{organization_id}/{asset_id}/original_{safe_filename(filename)}", source, content_type
+            )
+            if preview_path and preview_path.exists():
+                preview_key = put_blob_file(
+                    f"geolabel/{organization_id}/{asset_id}/preview.png", preview_path, "image/png"
+                )
+            source.unlink(missing_ok=True)
+            if preview_path:
+                preview_path.unlink(missing_ok=True)
+            return storage_key, preview_key
+        except Exception:
+            for key in (storage_key, preview_key):
+                if key:
+                    try:
+                        delete_blob_key(key)
+                    except Exception:
+                        pass
+            raise
+
     target, storage_key = make_storage_paths(organization_id, asset_id, filename)
     shutil.move(str(source), str(target))
     preview_key = None
@@ -257,6 +322,18 @@ def save_temp_asset(source: Path, organization_id: str, asset_id: str, filename:
         shutil.move(str(preview_path), str(preview_target))
         preview_key = preview_target.relative_to(storage_root()).as_posix()
     return storage_key, preview_key
+
+
+def delete_storage_key(key: str | None) -> None:
+    if not key:
+        return
+    if is_blob_key(key):
+        delete_blob_key(key)
+        return
+    try:
+        resolve_storage_key(key).unlink(missing_ok=True)
+    except ValueError:
+        return
 
 
 def new_temp_path() -> Path:

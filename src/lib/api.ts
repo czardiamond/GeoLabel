@@ -1,11 +1,20 @@
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 export function normalizeApiBase(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
+    if (trimmed.includes('\\') || trimmed.includes('?') || trimmed.includes('#') || trimmed.split('/').includes('..')) {
+      throw new Error('A same-origin API path must not contain a query, fragment, backslash, or parent traversal.');
+    }
+    let path = trimmed;
+    while (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
+    return path;
+  }
   let url: URL;
   try {
-    url = new URL(value.trim());
+    url = new URL(trimmed);
   } catch {
-    throw new Error('Enter an absolute API URL, including https://.');
+    throw new Error('Enter an absolute HTTPS API URL or a same-origin path such as /api.');
   }
 
   const isLoopbackHttp = url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname.toLowerCase());

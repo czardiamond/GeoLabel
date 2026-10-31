@@ -12,3 +12,4 @@ pyproj>=3.6.0
 Pillow>=10.0.0
 rasterio>=1.4.0
 python-multipart>=0.0.12
+vercel==0.12.1

@@ -1,3 +1,5 @@
+import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from backend.config import settings
@@ -6,6 +8,10 @@ from backend.config import settings
 engine_kwargs = {}
 if settings.DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
+elif os.getenv("VERCEL") == "1":
+    engine_kwargs["pool_size"] = 1
+    engine_kwargs["max_overflow"] = 0
+    engine_kwargs["pool_pre_ping"] = True
 else:
     engine_kwargs["pool_size"] = 5
     engine_kwargs["max_overflow"] = 10

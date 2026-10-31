@@ -2,6 +2,7 @@
 
 import logging
 import json
+import os
 import secrets
 import uuid
 from typing import Optional
@@ -9,6 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
@@ -18,6 +20,7 @@ from sqlalchemy.orm import Session
 from backend.auth import generate_annotator_credentials, get_current_annotator
 from backend.asset_storage import storage_root
 from backend.config import settings
+from backend.temp_storage import AssetCapacityError, AssetTempStorageMiddleware
 from backend.database import get_db
 from backend.geo_utils import reproject_feature_collection
 from backend.models import Annotation, AnnotatorApiKey, QuoteRequest, Task, utcnow_naive
@@ -36,13 +39,23 @@ from backend.schemas import (
 from backend.scoring import build_consensus_geojson, compute_task_iaa, scoring_configuration, SCORER_VERSION
 from backend.identity import router as identity_router
 from backend.workflows import router as workflows_router
+from backend.blob_storage import check_access as check_blob_access, is_configured as blob_storage_configured
 
 logger = logging.getLogger(__name__)
+IS_VERCEL = os.getenv("VERCEL") == "1"
+API_PREFIX = "/api" if IS_VERCEL else ""
+
+
+def api_path(path: str) -> str:
+    return f"{API_PREFIX}{path}"
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description="API for geospatial annotation task intake, annotation submission, and agreement scoring.",
+    openapi_url=api_path("/openapi.json"),
+    docs_url=api_path("/docs"),
+    redoc_url=None,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -52,10 +65,17 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Annotator-API-Key"],
 )
 
+app.add_middleware(AssetTempStorageMiddleware)
+
+@app.exception_handler(AssetCapacityError)
+async def asset_capacity_error(_request, exc: AssetCapacityError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+
+
 security = HTTPBearer(auto_error=False)
 
-app.include_router(identity_router)
-app.include_router(workflows_router)
+app.include_router(identity_router, prefix=API_PREFIX)
+app.include_router(workflows_router, prefix=API_PREFIX)
 
 
 def webhook_host_allowed(webhook_url: str) -> bool:
@@ -116,44 +136,57 @@ async def trigger_webhook_callback(webhook_url: str, task_data: dict):
         logger.exception("Webhook delivery failed for task %s", task_data["id"])
 
 
-@app.get("/health")
+@app.get(api_path("/health"))
 def health_check():
     """Liveness probe."""
     return {"status": "ok", "service": "geolabel-backend", "version": settings.VERSION}
 
 
-@app.get("/health/ready")
+@app.get(api_path("/health/ready"))
 def readiness_check(db: Session = Depends(get_db)):
-    """Readiness probe for database and configured local asset storage."""
+    """Readiness probe for persistent database and configured private asset storage."""
+    if IS_VERCEL and settings.DATABASE_URL.startswith("sqlite"):
+        raise HTTPException(status_code=503, detail="Persistent PostgreSQL is required on Vercel; SQLite is ephemeral there.")
+    if IS_VERCEL and not blob_storage_configured():
+        raise HTTPException(status_code=503, detail="Private Vercel Blob storage is not configured.")
     try:
         db.execute(text("SELECT 1"))
     except Exception as exc:
         logger.exception("Database readiness check failed")
         raise HTTPException(status_code=503, detail="Database is not ready") from exc
-    probe = None
-    try:
-        root = storage_root()
-        probe = root / f".health-check-{uuid.uuid4().hex}"
-        probe.write_bytes(b"geolabel-storage-ready")
-        if probe.read_bytes() != b"geolabel-storage-ready":
-            raise OSError("storage readiness marker did not round-trip")
-    except Exception as exc:
-        logger.exception("Local asset storage readiness check failed")
-        raise HTTPException(status_code=503, detail="Configured local asset storage is not ready") from exc
-    finally:
-        if probe:
-            probe.unlink(missing_ok=True)
+    if blob_storage_configured():
+        try:
+            check_blob_access()
+        except Exception as exc:
+            logger.exception("Private Blob storage readiness check failed")
+            raise HTTPException(status_code=503, detail="Private asset storage is not ready") from exc
+        storage_status = "private_vercel_blob"
+    else:
+        probe = None
+        try:
+            root = storage_root()
+            probe = root / f".health-check-{uuid.uuid4().hex}"
+            probe.write_bytes(b"geolabel-storage-ready")
+            if probe.read_bytes() != b"geolabel-storage-ready":
+                raise OSError("storage readiness marker did not round-trip")
+        except Exception as exc:
+            logger.exception("Local asset storage readiness check failed")
+            raise HTTPException(status_code=503, detail="Configured local asset storage is not ready") from exc
+        finally:
+            if probe:
+                probe.unlink(missing_ok=True)
+        storage_status = "writable_local"
     return {"status": "ready", "service": "geolabel-backend", "version": settings.VERSION,
-            "asset_storage": "writable_local"}
+            "asset_storage": storage_status}
 
 
-@app.get("/")
+@app.get(api_path("/"))
 def root_info():
-    return {"message": "GeoLabel Geospatial Annotation API", "docs": "/docs", "health": "/health"}
+    return {"message": "GeoLabel Geospatial Annotation API", "docs": api_path("/docs"), "health": api_path("/health")}
 
 
 @app.post(
-    "/annotators/register",
+    api_path("/annotators/register"),
     response_model=AnnotatorRegisterResponse,
     status_code=status.HTTP_201_CREATED,
 )
@@ -188,7 +221,7 @@ def register_annotator(
     )
 
 
-@app.delete("/annotators/{annotator_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete(api_path("/annotators/{annotator_id}"), status_code=status.HTTP_204_NO_CONTENT)
 def revoke_annotator_key(
     annotator_id: str,
     db: Session = Depends(get_db),
@@ -203,7 +236,7 @@ def revoke_annotator_key(
     return None
 
 
-@app.post("/quotes", response_model=QuoteResponse, status_code=status.HTTP_201_CREATED)
+@app.post(api_path("/quotes"), response_model=QuoteResponse, status_code=status.HTTP_201_CREATED)
 def create_quote_request(payload: QuoteCreate, db: Session = Depends(get_db)):
     """Persist a project scoping request; this endpoint does not send email or create a price quote."""
     quote = QuoteRequest(
@@ -228,7 +261,7 @@ def create_quote_request(payload: QuoteCreate, db: Session = Depends(get_db)):
     return QuoteResponse(id=quote.id, status=quote.status, submitted_at=quote.created_at)
 
 
-@app.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
+@app.post(api_path("/tasks"), response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: TaskCreate,
     db: Session = Depends(get_db),
@@ -251,7 +284,7 @@ def create_task(
     return new_task
 
 
-@app.get("/tasks/{task_id}", response_model=TaskResponse)
+@app.get(api_path("/tasks/{task_id}"), response_model=TaskResponse)
 def get_task_status(
     task_id: str,
     db: Session = Depends(get_db),
@@ -264,7 +297,7 @@ def get_task_status(
     return task
 
 
-@app.get("/annotator/tasks/{task_id}", response_model=AnnotatorTaskResponse)
+@app.get(api_path("/annotator/tasks/{task_id}"), response_model=AnnotatorTaskResponse)
 def get_assigned_task(
     task_id: str,
     db: Session = Depends(get_db),
@@ -277,7 +310,7 @@ def get_assigned_task(
     return task
 
 
-@app.get("/tasks/{task_id}/results", response_model=TaskResultsResponse)
+@app.get(api_path("/tasks/{task_id}/results"), response_model=TaskResultsResponse)
 def get_task_results(
     task_id: str,
     db: Session = Depends(get_db),
@@ -305,7 +338,7 @@ def get_task_results(
     )
 
 
-@app.post("/tasks/{task_id}/webhook", response_model=TaskResponse)
+@app.post(api_path("/tasks/{task_id}/webhook"), response_model=TaskResponse)
 def register_webhook(
     task_id: str,
     payload: WebhookRegister,
@@ -324,7 +357,7 @@ def register_webhook(
     return task
 
 
-@app.post("/tasks/{task_id}/annotations", response_model=AnnotatorTaskResponse)
+@app.post(api_path("/tasks/{task_id}/annotations"), response_model=AnnotatorTaskResponse)
 def submit_annotation(
     task_id: str,
     payload: AnnotationSubmit,

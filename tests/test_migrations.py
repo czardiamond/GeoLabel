@@ -80,6 +80,7 @@ def test_bootstrap_migrates_existing_unversioned_database_without_losing_records
     annotation_columns = {row[1] for row in migrated.execute("PRAGMA table_info(annotations)")}
     video_columns = {row[1] for row in migrated.execute("PRAGMA table_info(video_segment_submissions)")}
     new_tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    upload_intent_columns = {row[1] for row in migrated.execute("PRAGMA table_info(upload_intents)")}
     quote_table = migrated.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='quote_requests'").fetchone()
     version = migrated.execute("SELECT version_num FROM alembic_version").fetchone()
     assert task == ("task_existing", "in_progress")
@@ -87,11 +88,12 @@ def test_bootstrap_migrates_existing_unversioned_database_without_losing_records
     assert "task_id" in key_columns
     assert {"project_id", "asset_id", "priority", "review_status", "task_type", "scoring_version", "scoring_config_json"}.issubset(task_columns)
     assert {"review_status", "reviewed_at", "review_comment"}.issubset(annotation_columns)
-    assert {"organizations", "projects", "datasets", "assets", "organization_memberships", "audit_events", "task_comments", "task_assignments", "auth_throttles", "annotation_drafts", "video_segment_submissions"}.issubset(new_tables)
+    assert {"organizations", "projects", "datasets", "assets", "organization_memberships", "audit_events", "task_comments", "task_assignments", "auth_throttles", "annotation_drafts", "video_segment_submissions", "upload_intents"}.issubset(new_tables)
+    assert {"id", "asset_id", "pathname", "dataset_id", "creator_user_id", "declared_filename", "declared_content_type", "declared_size_bytes", "status", "created_at", "expires_at"}.issubset(upload_intent_columns)
     assert "tracks_json" in video_columns
     assert video_submission == ('[{"start_ms":100,"end_ms":300,"category":"building"}]', "[]")
     assert migrated.execute("SELECT review_status FROM tasks WHERE id='task_existing'").fetchone() == ("not_started",)
     assert migrated.execute("SELECT review_status FROM annotations WHERE id='annotation_existing'").fetchone() == ("pending",)
     assert quote_table is not None
-    assert version == ("0005_video_keyframe_tracks",)
+    assert version == ("0006_upload_intents",)
     migrated.close()

@@ -12,6 +12,7 @@
     "test": "node --experimental-strip-types --test src/lib/*.test.ts"
   },
   "dependencies": {
+    "@vercel/blob": "2.4.0",
     "lucide-react": "^0.546.0",
     "react": "^19.0.1",
     "react-dom": "^19.0.1"

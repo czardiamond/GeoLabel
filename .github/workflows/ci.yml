@@ -43,3 +43,7 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - name: Install private upload service dependencies
+        run: npm ci --prefix node_api
+      - name: Test private upload authorization and signed-callback boundary
+        run: npm test --prefix node_api

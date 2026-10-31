@@ -15,10 +15,18 @@ test('allows plain HTTP only for loopback development hosts', () => {
   assert.throws(() => normalizeApiBase('http://localhost.example.test:8000'), /Use HTTPS/);
 });
 
+test('allows safe same-origin API paths for a co-hosted deployment', () => {
+  assert.equal(normalizeApiBase('/api/'), '/api');
+  assert.equal(normalizeApiBase('/geolabel/v1'), '/geolabel/v1');
+  assert.throws(() => normalizeApiBase('//api.example.test'), /absolute HTTPS API URL/);
+  assert.throws(() => normalizeApiBase('/api?token=secret'), /same-origin API path/);
+  assert.throws(() => normalizeApiBase('/api/../admin'), /same-origin API path/);
+});
+
 test('rejects non-HTTPS schemes, embedded credentials, query strings, and fragments', () => {
   assert.throws(() => normalizeApiBase('ftp://api.example.test'), /Use HTTPS/);
   assert.throws(() => normalizeApiBase('https://user:secret@api.example.test'), /must not contain embedded credentials/);
   assert.throws(() => normalizeApiBase('https://api.example.test?token=secret'), /must not contain/);
   assert.throws(() => normalizeApiBase('https://api.example.test/#private'), /must not contain/);
-  assert.throws(() => normalizeApiBase('/relative/path'), /absolute API URL/);
+  assert.throws(() => normalizeApiBase('relative/path'), /absolute HTTPS API URL/);
 });

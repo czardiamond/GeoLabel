@@ -179,6 +179,24 @@ class Asset(Base):
             return {}
 
 
+class UploadIntent(Base):
+    """Database lease for one authorized direct upload."""
+    __tablename__ = "upload_intents"
+    __table_args__ = (UniqueConstraint("asset_id", name="uq_upload_intent_asset"),)
+
+    id = Column(String, primary_key=True, default=lambda: _id("upload"))
+    asset_id = Column(String, nullable=False, index=True)
+    pathname = Column(Text, nullable=False, unique=True)
+    dataset_id = Column(String, ForeignKey("datasets.id"), nullable=False, index=True)
+    creator_user_id = Column(String, ForeignKey("user_accounts.id"), nullable=False, index=True)
+    declared_filename = Column(String(255), nullable=False)
+    declared_content_type = Column(String(120), nullable=False)
+    declared_size_bytes = Column(Integer, nullable=False)
+    status = Column(String(24), nullable=False, default="pending", index=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
 class AnnotatorApiKey(Base):
     __tablename__ = "annotator_api_keys"
 
