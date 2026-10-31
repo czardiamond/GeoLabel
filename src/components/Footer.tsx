@@ -11,8 +11,8 @@ export const Footer: React.FC = () => {
             <p className="mt-3 text-sm leading-relaxed">A GeoJSON-first geospatial annotation API foundation. This repository does not claim a staffed annotation operation, certification, audited security program, or production service-level agreement.</p>
           </div>
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs leading-relaxed">
-            <p className="font-semibold text-slate-200">Production note</p>
-            <p className="mt-2 max-w-sm">Configure a durable database, strong service secret, restricted CORS origins, HTTPS, backups, migrations, and operational monitoring before handling customer data.</p>
+            <p className="font-semibold text-slate-200">Deployment note</p>
+            <p className="mt-2 max-w-sm">The configured Preview uses Neon Postgres for task data and private Vercel Blob for uploads; local development uses filesystem storage. This does not imply that Production is deployed or that independent accuracy, compliance, or service-level guarantees exist.</p>
           </div>
         </div>
         <div className="flex flex-col items-start justify-between gap-4 border-t border-slate-800 pt-5 text-xs sm:flex-row sm:items-center">

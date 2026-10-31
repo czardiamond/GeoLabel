@@ -44,7 +44,7 @@ export const Hero: React.FC<HeroProps> = ({ onQuoteClick, onDemoClick }) => (
             </li>
           ))}
         </ol>
-        <p className="mt-5 text-xs leading-relaxed text-slate-500">Current boundaries: GeoLabel stores external imagery references but does not ingest or display imagery. Annotation geometry is submitted as GeoJSON; this build has no interactive raster drawing or AI labeling.</p>
+        <p className="mt-5 text-xs leading-relaxed text-slate-500">Current boundaries: GeoLabel does not fetch or render external imagery references. The workspace supports private raster uploads and interactive vector drawing; annotation geometry remains GeoJSON-first, and provider AI is not enabled.</p>
       </div>
     </div>
   </section>

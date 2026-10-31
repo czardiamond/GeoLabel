@@ -16,9 +16,9 @@ const currentCapabilities = [
 ];
 
 const notYetAvailable = [
-  'SSO, LDAP, MFA, password recovery, and automatic invitation email',
-  'Credentialed S3/GCS object-storage adapters and deployment-shared asset storage',
-  'AI detection, tracking, segmentation, and inference-provider credentials',
+  'SSO, MFA, email-based invitation delivery, and password recovery',
+  'Credentialed S3/GCS object-storage adapters and general object-lifecycle policies',
+  'Provider AI suggestions and inference-provider credentials',
   'Independently validated quality thresholds, compliance attestations, or service-level guarantees',
 ];
 
@@ -56,7 +56,7 @@ export default function App() {
               <ul className="mt-3 grid gap-2 text-sm text-amber-100/75 sm:grid-cols-2">
                 {notYetAvailable.map((item) => <li key={item}>• {item}</li>)}
               </ul>
-              <p className="mt-4 text-xs leading-relaxed text-slate-400">Agreement, consensus, and gold-set metrics use heuristic spatial matching and are not independently validated quality guarantees. Uploaded files are stored on the configured local volume; configure durable, private storage before multi-instance or production use.</p>
+              <p className="mt-4 text-xs leading-relaxed text-slate-400">Agreement, consensus, and gold-set metrics use heuristic spatial matching and are not independently validated quality guarantees. On the configured Preview, task data uses Neon Postgres and private uploads use Vercel Blob; local development uses filesystem storage. This does not imply that Production is deployed.</p>
             </div>
           </div>
         </section>
