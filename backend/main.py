@@ -8,6 +8,10 @@ import uuid
 from typing import Optional
 from urllib.parse import urlsplit
 
+from backend.native_runtime import prepare_native_runtime
+
+prepare_native_runtime()
+
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Security, status
 from fastapi.responses import JSONResponse
