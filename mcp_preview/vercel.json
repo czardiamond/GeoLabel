@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "python3 prepare_shared_modules.py && python3 -m pip install -r requirements.txt",
+  "git": {
+    "deploymentEnabled": {
+      "**": false,
+      "main": false,
+      "cue/geolabel-verified-workflows": true
+    }
+  }
+}

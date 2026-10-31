@@ -13,8 +13,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from backend.geo_utils import reproject_feature_collection
-from backend.geo_validation import MAX_FEATURES, validate_geojson_collection
-from backend.gis_operations import spatial_join as run_spatial_join
+from backend.geo_validation import MAX_FEATURES, SUPPORTED_GEOMETRIES, validate_geojson_collection
+from backend.spatial_operations import spatial_join as run_spatial_join
 
 MAX_TOOL_PAYLOAD_BYTES = 2_000_000
 MAX_MCP_FEATURES = 100
@@ -49,7 +49,8 @@ def build_server() -> MCPServer:
         version="1.0.0",
         description="Bounded geospatial validation and transformation tools using GeoLabel's tested GIS algorithms.",
         instructions=(
-            "Use validate_geojson before using or submitting a collection. Always provide its actual CRS; "
+            "Use validate_geojson for structural checks and validate_annotation_labels when a project taxonomy is available. "
+            "Always provide the actual CRS; "
             "a successful structural validation is not a claim that annotations are semantically correct. "
             "These tools process only supplied payloads and do not persist data."
         ),
@@ -62,6 +63,105 @@ def build_server() -> MCPServer:
             _check_payload_size({"geojson": geojson, "crs": crs, "required_fields": required_fields})
             _check_collection(geojson)
             return validate_geojson_collection(geojson, crs, required_fields)
+        except (ValueError, TypeError) as exc:
+            raise _tool_error(exc) from exc
+
+    @server.tool()
+    def validate_annotation_labels(
+        geojson: dict[str, Any],
+        crs: str,
+        label_field: str,
+        allowed_labels: list[str],
+        required_fields: list[str] | None = None,
+        geometry_by_label: dict[str, list[str]] | None = None,
+    ) -> dict[str, Any]:
+        """Validate project-configured label values and optional label-to-geometry rules, plus GeoLabel's structural checks.
+
+        This can check taxonomy membership and declared geometry compatibility only. It cannot verify semantic correctness,
+        agreement with source imagery, or fitness for a task; human review and project-specific quality evidence remain required.
+        """
+        try:
+            request = {
+                "geojson": geojson,
+                "crs": crs,
+                "label_field": label_field,
+                "allowed_labels": allowed_labels,
+                "required_fields": required_fields,
+                "geometry_by_label": geometry_by_label,
+            }
+            _check_payload_size(request)
+            _check_collection(geojson)
+            if not isinstance(label_field, str) or not label_field.strip() or label_field != label_field.strip() or len(label_field) > 100:
+                raise ValueError("label_field must be a non-empty property name of 100 characters or fewer")
+            if not isinstance(allowed_labels, list) or not 1 <= len(allowed_labels) <= 100:
+                raise ValueError("allowed_labels must contain between 1 and 100 labels")
+            if any(not isinstance(label, str) or not label.strip() or label != label.strip() or len(label) > 100 for label in allowed_labels):
+                raise ValueError("allowed_labels must contain non-empty, trimmed strings of 100 characters or fewer")
+            if len(set(allowed_labels)) != len(allowed_labels):
+                raise ValueError("allowed_labels must not contain duplicates")
+
+            if geometry_by_label is not None:
+                if not isinstance(geometry_by_label, dict) or len(geometry_by_label) > 100:
+                    raise ValueError("geometry_by_label must be an object with at most 100 label entries")
+                for label, geometry_types in geometry_by_label.items():
+                    if label not in allowed_labels:
+                        raise ValueError(f"geometry_by_label contains a label not listed in allowed_labels: {label!r}")
+                    if not isinstance(geometry_types, list) or not geometry_types:
+                        raise ValueError(f"geometry_by_label[{label!r}] must be a non-empty list")
+                    if any(not isinstance(item, str) or item not in SUPPORTED_GEOMETRIES for item in geometry_types):
+                        raise ValueError(f"geometry_by_label[{label!r}] contains an unsupported GeoJSON geometry type")
+                    if len(set(geometry_types)) != len(geometry_types):
+                        raise ValueError(f"geometry_by_label[{label!r}] must not contain duplicate geometry types")
+
+            structural = validate_geojson_collection(geojson, crs, required_fields)
+            allowed = set(allowed_labels)
+            label_errors: list[dict[str, Any]] = []
+            for index, feature in enumerate(geojson["features"]):
+                if not isinstance(feature, dict) or feature.get("type") != "Feature":
+                    continue  # Reported by the structural validator.
+                properties = feature.get("properties")
+                label = properties.get(label_field) if isinstance(properties, dict) else None
+                if not isinstance(label, str) or not label.strip():
+                    label_errors.append({
+                        "feature_index": index,
+                        "code": "missing_or_invalid_label",
+                        "field": label_field,
+                        "message": f"Property '{label_field}' must contain a non-empty string label",
+                    })
+                    continue
+                if label not in allowed:
+                    label_errors.append({
+                        "feature_index": index,
+                        "code": "unknown_label",
+                        "field": label_field,
+                        "label": label,
+                        "message": f"Label '{label}' is not in the configured allowed_labels taxonomy",
+                    })
+                    continue
+                geometry_type = (feature.get("geometry") or {}).get("type") if isinstance(feature.get("geometry"), dict) else None
+                permitted_types = (geometry_by_label or {}).get(label)
+                if permitted_types and geometry_type not in permitted_types:
+                    label_errors.append({
+                        "feature_index": index,
+                        "code": "label_geometry_mismatch",
+                        "field": label_field,
+                        "label": label,
+                        "geometry_type": geometry_type,
+                        "allowed_geometry_types": permitted_types,
+                        "message": f"Geometry type '{geometry_type}' is not allowed for label '{label}'",
+                    })
+
+            return {
+                "valid": structural["valid"] and not label_errors,
+                "feature_count": structural["feature_count"],
+                "label_field": label_field,
+                "allowed_labels": allowed_labels,
+                "geometry_by_label": geometry_by_label or {},
+                "label_error_count": len(label_errors),
+                "label_errors": label_errors,
+                "structural_validation": structural,
+                "accuracy_note": "Taxonomy membership and geometry compatibility do not establish semantic correctness or agreement with imagery/ground truth; keep human review and project-specific quality evaluation in the workflow.",
+            }
         except (ValueError, TypeError) as exc:
             raise _tool_error(exc) from exc
 

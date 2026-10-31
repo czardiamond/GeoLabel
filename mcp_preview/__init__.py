@@ -1,0 +1,1 @@
+"""Standalone Preview-only remote MCP deployment package."""

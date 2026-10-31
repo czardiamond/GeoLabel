@@ -13,3 +13,5 @@ geolabel-assets/
 .env*
 !.env.example
 .DS_Store
+mcp_preview/backend/
+mcp_preview/geolabel_mcp/
