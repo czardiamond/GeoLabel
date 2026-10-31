@@ -209,3 +209,20 @@ The official-documentation behavior comparison is recorded in [`docs/competitor-
 - Decide who may create organizations with the deployment service key; benchmark and independently validate geospatial metrics and consensus thresholds on representative imagery/CRS data.
 
 No billing provider is configured by this code, and it neither charges users nor claims billing as a peer-product feature.
+
+
+## GeoJSON validation API and MCP tools
+
+The organization workflow API now includes `POST /organizations/{organization_id}/gis/validate`. An authenticated organization member can submit a GeoJSON `FeatureCollection`, an explicit CRS identifier, and optional required property names. The report returns geometry counts, feature-level errors and warnings, and the exact checks performed. Requests are limited to 500 features, 100,000 coordinates, and 2 MB; invalid records are reported rather than silently repaired. The check covers feature structure, finite 2D/3D coordinates, supported geometry types, ring closure, Shapely topology, duplicate IDs when present, optional required fields, and WGS84 coordinate ranges when the CRS is EPSG:4326. It does **not** certify semantic label correctness, agreement with ground truth, or fitness for a particular project.
+
+A local MCP server exposes the same tested GIS functions over the official MCP Python SDK's stdio transport. Install the backend and optional MCP dependencies, then configure an MCP host to run the module from the repository root:
+
+```bash
+pip install -r requirements.txt -r requirements-mcp.txt
+python -m geolabel_mcp.server
+```
+
+The server provides `validate_geojson`, `reproject_geojson`, and `spatial_join`. Each MCP tool accepts data supplied in the request, requires explicit CRS values where relevant, and is bounded to 100 features per collection and 2 MB per tool payload. It does not access arbitrary local files, organization records, or persist submitted data. The MCP tools run locally by stdio; no public MCP endpoint is deployed by the current Vercel frontend project.
+
+
+The optional MCP server requires Python 3.11 or newer. Its `spatial_join` tool returns only the matching source/target feature indices; use those indices to look up properties in the original request rather than copying large or sensitive properties into every match. The standard Python MCP SDK is pinned to `mcp==2.3.0` for reproducible development and CI.

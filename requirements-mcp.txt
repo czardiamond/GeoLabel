@@ -1,0 +1,2 @@
+# Optional local stdio MCP server dependencies. Install alongside requirements.txt.
+mcp==2.3.0

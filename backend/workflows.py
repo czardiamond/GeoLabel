@@ -40,6 +40,7 @@ from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
 from backend.geo_utils import reproject_feature_collection
+from backend.geo_validation import validate_geojson_collection
 from backend.inference import (
     MAX_IMAGE_BYTES,
     get_inference_status,
@@ -253,6 +254,31 @@ class SpatialJoinRequest(BaseModel):
         if not isinstance(value, dict) or not isinstance(value.get("features"), list) or len(value["features"]) > 500:
             raise ValueError("Each FeatureCollection must contain at most 500 features")
         return value
+
+
+class GeoJSONValidationRequest(BaseModel):
+    geojson: dict
+    crs: str = Field(min_length=1, max_length=256)
+    required_fields: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("geojson")
+    @classmethod
+    def bounded_feature_collection(cls, value):
+        if not isinstance(value, dict) or value.get("type") != "FeatureCollection" or not isinstance(value.get("features"), list):
+            raise ValueError("geojson must be a GeoJSON FeatureCollection")
+        if len(value["features"]) > 500:
+            raise ValueError("FeatureCollection exceeds the 500-feature validation limit")
+        if len(json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")) > 2_000_000:
+            raise ValueError("GeoJSON exceeds the 2 MB validation request limit")
+        return value
+
+    @field_validator("crs")
+    @classmethod
+    def valid_explicit_crs(cls, value):
+        try:
+            return pyproj.CRS.from_user_input(value).to_string()
+        except Exception as exc:
+            raise ValueError("crs must identify a valid coordinate reference system") from exc
 
 
 class RasterStatsRequest(BaseModel):
@@ -1587,6 +1613,22 @@ def run_spatial_join(organization_id: str, payload: SpatialJoinRequest, member: 
     return {"source_crs": pyproj.CRS.from_user_input(payload.source_crs).to_string(),
             "target_crs": pyproj.CRS.from_user_input(payload.target_crs).to_string(),
             "predicate": payload.predicate, "match_count": len(matches), "matches": matches}
+
+
+@router.post("/organizations/{organization_id}/gis/validate")
+def validate_annotation_geojson(organization_id: str, payload: GeoJSONValidationRequest,
+                                member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    membership = membership_for(db, member.user_id, organization_id)
+    require_roles(membership, "owner", "admin", "annotator", "reviewer", "analyst")
+    try:
+        result = validate_geojson_collection(payload.geojson, payload.crs, payload.required_fields)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, organization_id, member.user_id, "gis.geojson_validate", "organization", organization_id,
+          {"crs": result["crs"], "feature_count": result["feature_count"],
+           "valid": result["valid"], "error_count": result["error_count"]})
+    db.commit()
+    return result
 
 
 @router.post("/assets/{asset_id}/raster/statistics")

@@ -72,6 +72,46 @@ def test_spatial_join_and_raster_analysis_are_role_checked_and_grid_safe(api_cli
     assert join.json()["match_count"] == 1
     assert join.json()["matches"][0]["source_properties"] == {"name": "source"}
 
+    validation = client.post(f"/organizations/{org['id']}/gis/validate", headers=owner_headers, json={
+        "geojson": collection,
+        "crs": "EPSG:4326",
+        "required_fields": ["name"],
+    })
+    assert validation.status_code == 200, validation.text
+    assert validation.json()["valid"] is True
+    assert validation.json()["geometry_counts"] == {"Polygon": 1}
+
+    invalid_collection = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {}, "geometry": {
+            "type": "Polygon", "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 1], [0, 0]]],
+        }}],
+    }
+    invalid = client.post(f"/organizations/{org['id']}/gis/validate", headers=owner_headers, json={
+        "geojson": invalid_collection,
+        "crs": "EPSG:4326",
+    })
+    assert invalid.status_code == 200
+    assert invalid.json()["valid"] is False
+    assert any(error["code"] == "topologically_invalid" for error in invalid.json()["errors"])
+    huge_integer_collection = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {}, "geometry": {
+            "type": "Point", "coordinates": [10**400, 0],
+        }}],
+    }
+    huge_integer = client.post(f"/organizations/{org['id']}/gis/validate", headers=owner_headers, json={
+        "geojson": huge_integer_collection,
+        "crs": "EPSG:4326",
+    })
+    assert huge_integer.status_code == 200
+    assert any(error["code"] == "non_finite_coordinate" for error in huge_integer.json()["errors"])
+    missing_crs = client.post(f"/organizations/{org['id']}/gis/validate", headers=owner_headers, json={
+        "geojson": collection,
+        "crs": "not-a-crs",
+    })
+    assert missing_crs.status_code == 422
+
     invite = client.post(f"/organizations/{org['id']}/invitations", headers=owner_headers,
                          json={"email": "gis-worker@example.com", "role": "annotator"})
     accepted = client.post("/auth/invitations/accept", json={
@@ -80,3 +120,9 @@ def test_spatial_join_and_raster_analysis_are_role_checked_and_grid_safe(api_cli
     worker_headers = {"Authorization": f"Bearer {accepted.json()['access_token']}"}
     denied = client.post(f"/assets/{first.json()['id']}/raster/statistics", headers=worker_headers, json={})
     assert denied.status_code == 403
+    worker_validation = client.post(f"/organizations/{org['id']}/gis/validate", headers=worker_headers, json={
+        "geojson": collection,
+        "crs": "EPSG:4326",
+        "required_fields": ["name"],
+    })
+    assert worker_validation.status_code == 200, worker_validation.text
