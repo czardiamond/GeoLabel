@@ -36,6 +36,14 @@ def test_spatial_join_and_raster_analysis_are_role_checked_and_grid_safe(api_cli
                              files={"file": ("different-grid.tif", write_raster(np.full((4, 4), 90), from_origin(-2, 2, 0.5, 0.5)), "image/tiff")})
     assert first.status_code == second.status_code == mismatched.status_code == 201
 
+    catalog = client.get(f"/datasets/{dataset['id']}/assets", headers=owner_headers)
+    assert catalog.status_code == 200
+    raster_metadata = next(asset for asset in catalog.json() if asset["id"] == first.json()["id"])["metadata"]
+    assert raster_metadata["band_count"] == 1
+    assert raster_metadata["band_dtypes"] == ["uint8"]
+    assert raster_metadata["resolution"] == [0.5, 0.5]
+    assert raster_metadata["nodata_values"] == [None]
+
     stats = client.post(f"/assets/{first.json()['id']}/raster/statistics", headers=owner_headers,
                         json={"max_pixels": 16})
     assert stats.status_code == 200, stats.text
