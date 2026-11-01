@@ -1531,6 +1531,8 @@ def review_task(task_id: str, payload: ReviewDecision, member: MemberContext = D
     task, membership = _task_for_member(db, task_id, member)
     task = _locked_task(db, task_id)
     require_roles(membership, "owner", "admin", "reviewer")
+    if task.review_status != "pending_review":
+        raise HTTPException(status_code=409, detail="This task is not currently ready for review.")
     annotations = db.query(Annotation).filter(Annotation.task_id == task.id).all()
     videos = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id == task.id).all()
     if not annotations and not videos:

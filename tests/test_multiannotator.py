@@ -60,6 +60,10 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     assert first_submission.status_code == 200, first_submission.text
     assert first_submission.json()["review_status"] == "not_started"
     assert first_submission.json()["reserved_by_user_id"] is None
+    premature_review = client.post(f"/work/tasks/{task_id}/review", headers=owner_headers,
+                                   json={"decision": "accept", "comment": "Too early."})
+    assert premature_review.status_code == 409
+    assert client.get(f"/work/tasks/{task_id}", headers=owner_headers).json()["review_status"] == "not_started"
     unavailable = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers)
     assert unavailable.status_code == 200
     assert unavailable.json()["available"] is False
@@ -95,5 +99,15 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
                                   json={"geojson": polygon_collection()})
     assert second_revision.status_code == 200
     assert second_revision.json()["review_status"] == "pending_review"
+    accepted = client.post(f"/work/tasks/{task_id}/review", headers=owner_headers,
+                           json={"decision": "accept", "comment": "Complete review."})
+    assert accepted.status_code == 200
+    assert accepted.json()["review_status"] == "accepted"
+    duplicate_review = client.post(f"/work/tasks/{task_id}/review", headers=owner_headers,
+                                   json={"decision": "rework", "comment": "Must remain closed."})
+    assert duplicate_review.status_code == 409
+    final_task = client.get(f"/work/tasks/{task_id}", headers=owner_headers).json()
+    assert final_task["review_status"] == "accepted"
+    assert final_task["status"] == "completed"
     retained = client.delete(f"/work/tasks/{task_id}/assignments/{worker_ids[0]}", headers=owner_headers)
     assert retained.status_code == 409
