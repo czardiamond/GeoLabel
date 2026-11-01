@@ -51,6 +51,16 @@ def test_server_draft_recovery_is_versioned_private_bounded_and_cleared_on_submi
     assert inference_status.json()["human_review_required"] is True
     assert client.get(f"/work/tasks/{task_id}/inference/status", headers=unassigned_headers).status_code == 403
 
+    too_many_features = {"type": "FeatureCollection", "features": [None] * 10_001}
+    too_many = client.post(f"/work/tasks/{task_id}/annotations", headers=worker_headers,
+                           json={"geojson": too_many_features})
+    assert too_many.status_code == 413
+    monkeypatch.setattr(settings, "MAX_ANNOTATION_SUBMISSION_BYTES", 30)
+    too_large = client.post(f"/work/tasks/{task_id}/annotations", headers=worker_headers,
+                            json={"geojson": {"type": "FeatureCollection", "features": []}})
+    assert too_large.status_code == 413
+    monkeypatch.setattr(settings, "MAX_ANNOTATION_SUBMISSION_BYTES", 16_000_000)
+
     missing = client.get(f"/work/tasks/{task_id}/draft", headers=worker_headers)
     assert missing.status_code == 200
     assert missing.json() == {"available": False, "version": 0}

@@ -612,9 +612,17 @@ def _validate_remote_url(value: str) -> str:
 
 
 def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
-    if geojson.get("type") != "FeatureCollection" or not isinstance(geojson.get("features"), list):
+    if not isinstance(geojson, dict) or geojson.get("type") != "FeatureCollection" or not isinstance(geojson.get("features"), list):
         raise HTTPException(status_code=422, detail="geojson must be a GeoJSON FeatureCollection with a features array.")
     source_features = geojson["features"]
+    if len(source_features) > 10_000:
+        raise HTTPException(status_code=413, detail="An annotation may contain at most 10,000 features.")
+    try:
+        encoded_size = len(json.dumps(geojson, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise HTTPException(status_code=422, detail="geojson must contain only finite, bounded JSON values.") from exc
+    if encoded_size > max(1, settings.MAX_ANNOTATION_SUBMISSION_BYTES):
+        raise HTTPException(status_code=413, detail="Annotation exceeds the configured MAX_ANNOTATION_SUBMISSION_BYTES limit.")
     masks = [
         (index, feature)
         for index, feature in enumerate(source_features)
@@ -1417,8 +1425,12 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
 @router.get("/work/tasks/{task_id}/annotations")
 def list_task_annotations(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member, db)
-    rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+        rows = db.query(Annotation).filter_by(task_id=task.id, annotator_id=member.user_id).order_by(Annotation.submitted_at.asc()).all()
+    else:
+        require_roles(membership, "owner", "admin", "reviewer", "analyst")
+        rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
     return [{"id": row.id, "annotator_id": row.annotator_id, "geojson": row.geojson, "submitted_at": row.submitted_at,
              "review_status": row.review_status, "review_comment": row.review_comment} for row in rows]
 

@@ -60,6 +60,15 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     assert first_submission.status_code == 200, first_submission.text
     assert first_submission.json()["review_status"] == "not_started"
     assert first_submission.json()["reserved_by_user_id"] is None
+    first_visible = client.get(f"/work/tasks/{task_id}/annotations", headers=workers[0])
+    assert first_visible.status_code == 200
+    assert [row["annotator_id"] for row in first_visible.json()] == [worker_ids[0]]
+    second_visible = client.get(f"/work/tasks/{task_id}/annotations", headers=workers[1])
+    assert second_visible.status_code == 200
+    assert second_visible.json() == []
+    owner_visible = client.get(f"/work/tasks/{task_id}/annotations", headers=owner_headers)
+    assert owner_visible.status_code == 200
+    assert [row["annotator_id"] for row in owner_visible.json()] == [worker_ids[0]]
     premature_review = client.post(f"/work/tasks/{task_id}/review", headers=owner_headers,
                                    json={"decision": "accept", "comment": "Too early."})
     assert premature_review.status_code == 409
@@ -77,6 +86,12 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     assert second_submission.status_code == 200, second_submission.text
     assert second_submission.json()["review_status"] == "pending_review"
     assert second_submission.json()["iaa_score"] == 1.0
+    for index, worker in enumerate(workers):
+        own_submission = client.get(f"/work/tasks/{task_id}/annotations", headers=worker)
+        assert own_submission.status_code == 200
+        assert [row["annotator_id"] for row in own_submission.json()] == [worker_ids[index]]
+    all_submissions = client.get(f"/work/tasks/{task_id}/annotations", headers=owner_headers)
+    assert sorted(row["annotator_id"] for row in all_submissions.json()) == sorted(worker_ids)
 
     consensus = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers)
     assert consensus.status_code == 200, consensus.text
