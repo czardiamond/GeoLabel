@@ -12,7 +12,7 @@ This folder is the root of a separate Vercel project. It exposes only the MCP St
 
 ## Connect
 
-Use the active feature-branch Preview hostname with `/mcp` as the MCP URL and supply the bearer key in the client’s Authorization header. Vercel creates the final hostname after the first Preview deployment.
+Connect to `https://geolabel-mcp-preview-git-cue-geola-0115af-czardiamonds-projects.vercel.app/mcp` and supply the bearer key in the client’s Authorization header. `GEOLABEL_MCP_API_KEY` is stored as a sensitive Vercel environment variable for Preview deployments of `cue/geolabel-verified-workflows` only; never commit the key or include it in the URL.
 
 This private Preview uses a high-entropy static bearer key for client compatibility. It is not a full OAuth 2.1 authorization server. Before any public or Production release, replace this with a standards-compliant OAuth 2.1 flow and revisit deployment protection, key rotation, rate limits, and operational monitoring.
 
