@@ -65,6 +65,7 @@ Local uploads stream to disk and use `MAX_ASSET_UPLOAD_MB` (default 512 MiB). Ve
 - Raster analysis exposes per-band valid-pixel statistics, CRS-aware polygon zonal summaries, and baseline-to-later GeoTIFF change comparisons in the workspace. Change comparisons require identical dimensions, band counts, CRS, and affine transform; they do not resample or infer acquisition dates, physical units, or semantic change. Processing is pixel-bounded and results can be downloaded as JSON.
 - The dataset asset catalog shows GeoTIFF dimensions, CRS, bounds, pixel resolution, band count, data types, band descriptions, NoData values, and file size when supplied by the source file.
 - Owners, admins, and reviewers can record or clear an asset's analyst-verified acquisition date; changes are audited. Raster comparisons display those dates and reject reversed ordering when both dates are set, but never infer dates from filenames.
+- The image annotator shows a throttled source-CRS coordinate readout under the cursor, computed from the asset affine transform rather than screen pixels; missing CRS/georeferencing is stated instead of guessed.
 
 The scoring implementation is **heuristic**, using the existing geospatial feature matcher at its default IoU threshold. Scorer version/configuration are persisted and category-tie behavior is deterministic. Gold-set scores depend on the correctness and representativeness of supplied gold data; they are not independently validated quality guarantees or a compliance attestation. Agreement/consensus outputs remain heuristic.
 
