@@ -13,6 +13,9 @@ from shapely.validation import explain_validity
 MAX_FEATURES = 500
 MAX_COORDINATES = 100_000
 MAX_REPORTED_ERRORS = 1_000
+MAX_SUBMISSION_FEATURES = 10_000
+MAX_SUBMISSION_COORDINATES = 500_000
+MAX_SUBMISSION_REPORTED_ERRORS = 20
 SUPPORTED_GEOMETRIES = {
     "Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon",
 }
@@ -48,40 +51,41 @@ def _check_linear_rings(geometry: dict[str, Any]) -> list[str]:
     geometry_type = geometry.get("type")
     coordinates = geometry.get("coordinates")
     errors: list[str] = []
+    sequence_types = (list, tuple)
 
     def check_ring(ring: Any, label: str) -> None:
-        if not isinstance(ring, list) or len(ring) < 4:
+        if not isinstance(ring, sequence_types) or len(ring) < 4:
             errors.append(f"{label} must contain at least four positions")
             return
         if ring[0] != ring[-1]:
             errors.append(f"{label} must be closed (first and last positions must match)")
 
-    if geometry_type == "LineString" and (not isinstance(coordinates, list) or len(coordinates) < 2):
+    if geometry_type == "LineString" and (not isinstance(coordinates, sequence_types) or len(coordinates) < 2):
         errors.append("LineString must contain at least two positions")
     elif geometry_type == "MultiLineString":
-        if not isinstance(coordinates, list) or not coordinates:
+        if not isinstance(coordinates, sequence_types) or not coordinates:
             errors.append("MultiLineString must contain at least one line")
         else:
             for index, line in enumerate(coordinates):
-                if not isinstance(line, list) or len(line) < 2:
+                if not isinstance(line, sequence_types) or len(line) < 2:
                     errors.append(f"MultiLineString line {index} must contain at least two positions")
     elif geometry_type == "Polygon":
-        if not isinstance(coordinates, list) or not coordinates:
+        if not isinstance(coordinates, sequence_types) or not coordinates:
             errors.append("Polygon must contain an exterior ring")
         else:
             for index, ring in enumerate(coordinates):
                 check_ring(ring, f"Polygon ring {index}")
     elif geometry_type == "MultiPolygon":
-        if not isinstance(coordinates, list) or not coordinates:
+        if not isinstance(coordinates, sequence_types) or not coordinates:
             errors.append("MultiPolygon must contain at least one polygon")
         else:
             for polygon_index, polygon in enumerate(coordinates):
-                if not isinstance(polygon, list) or not polygon:
+                if not isinstance(polygon, sequence_types) or not polygon:
                     errors.append(f"MultiPolygon polygon {polygon_index} must contain an exterior ring")
                     continue
                 for ring_index, ring in enumerate(polygon):
                     check_ring(ring, f"MultiPolygon polygon {polygon_index} ring {ring_index}")
-    elif geometry_type == "MultiPoint" and (not isinstance(coordinates, list) or not coordinates):
+    elif geometry_type == "MultiPoint" and (not isinstance(coordinates, sequence_types) or not coordinates):
         errors.append("MultiPoint must contain at least one position")
     return errors
 
@@ -90,6 +94,10 @@ def validate_geojson_collection(
     geojson: dict[str, Any],
     crs: str,
     required_fields: list[str] | None = None,
+    *,
+    max_features: int = MAX_FEATURES,
+    max_coordinates: int = MAX_COORDINATES,
+    max_reported_errors: int = MAX_REPORTED_ERRORS,
 ) -> dict[str, Any]:
     """Validate feature structure, explicit CRS, bounded coordinates, and geometry topology.
 
@@ -101,8 +109,8 @@ def validate_geojson_collection(
     features = geojson.get("features")
     if not isinstance(features, list):
         raise ValueError("FeatureCollection.features must be an array")
-    if len(features) > MAX_FEATURES:
-        raise ValueError(f"FeatureCollection exceeds the {MAX_FEATURES}-feature validation limit")
+    if len(features) > max_features:
+        raise ValueError(f"FeatureCollection exceeds the {max_features}-feature validation limit")
     if not isinstance(crs, str) or not crs.strip() or len(crs) > 256:
         raise ValueError("crs must be explicitly provided as a valid CRS identifier")
     try:
@@ -203,8 +211,8 @@ def validate_geojson_collection(
             errors.append({"feature_index": index, "code": "mixed_dimensions", "message": "A geometry must use a consistent 2D or 3D position dimension"})
             coordinates_valid = False
         coordinate_count += len(positions)
-        if coordinate_count > MAX_COORDINATES:
-            raise ValueError(f"FeatureCollection exceeds the {MAX_COORDINATES}-coordinate validation limit")
+        if coordinate_count > max_coordinates:
+            raise ValueError(f"FeatureCollection exceeds the {max_coordinates}-coordinate validation limit")
         if not coordinates_valid:
             continue
 
@@ -236,8 +244,8 @@ def validate_geojson_collection(
         "geometry_counts": dict(sorted(geometry_counts.items())),
         "required_fields": required_fields,
         "error_count": error_count,
-        "errors_truncated": error_count > MAX_REPORTED_ERRORS,
-        "errors": errors[:MAX_REPORTED_ERRORS],
+        "errors_truncated": error_count > max_reported_errors,
+        "errors": errors[:max_reported_errors],
         "warnings": warnings,
         "checks": [
             "GeoJSON FeatureCollection and Feature structure",
@@ -251,3 +259,26 @@ def validate_geojson_collection(
         ],
         "accuracy_note": "This is structural and geometric validation; it does not verify semantic annotation correctness or ground truth.",
     }
+
+
+def validate_annotation_submission(geojson: dict[str, Any], crs: str) -> dict[str, Any]:
+    """Apply strict, bounded geometry and category-property checks to a submission."""
+    report = validate_geojson_collection(
+        geojson,
+        crs,
+        required_fields=["category"],
+        max_features=MAX_SUBMISSION_FEATURES,
+        max_coordinates=MAX_SUBMISSION_COORDINATES,
+        max_reported_errors=MAX_SUBMISSION_REPORTED_ERRORS,
+    )
+    if report["valid"]:
+        return report
+
+    issues = []
+    for error in report["errors"]:
+        feature_index = error.get("feature_index")
+        location = f"features[{feature_index}]" if feature_index is not None else "FeatureCollection"
+        issues.append(f"{location}: {error['message']}")
+    if report["errors_truncated"]:
+        issues.append(f"{report['error_count'] - len(report['errors'])} additional issue(s) omitted")
+    raise ValueError("Annotation integrity validation failed: " + "; ".join(issues))

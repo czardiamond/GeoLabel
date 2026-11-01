@@ -26,7 +26,8 @@ from backend.asset_storage import storage_root
 from backend.config import settings
 from backend.temp_storage import AssetCapacityError, AssetTempStorageMiddleware
 from backend.database import get_db
-from backend.geo_utils import reproject_feature_collection
+from backend.geo_utils import get_feature_collection_crs, reproject_feature_collection
+from backend.geo_validation import validate_annotation_submission
 from backend.models import Annotation, AnnotatorApiKey, QuoteRequest, Task, utcnow_naive
 from backend.schemas import (
     AnnotatorTaskResponse,
@@ -384,9 +385,11 @@ def submit_annotation(
         raise HTTPException(status_code=409, detail="This annotator has already submitted an annotation for this task.")
 
     try:
+        validate_annotation_submission(payload.geojson, get_feature_collection_crs(payload.geojson))
         reprojected_geojson = reproject_feature_collection(payload.geojson, task.crs)
+        validate_annotation_submission(reprojected_geojson, task.crs)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Submission CRS reprojection failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Submission integrity or CRS validation failed: {exc}") from exc
 
     allowed_categories = set(task.taxonomy)
     for index, feature in enumerate(reprojected_geojson.get("features", [])):

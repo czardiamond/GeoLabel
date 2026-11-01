@@ -1,6 +1,6 @@
 import pytest
 
-from backend.geo_validation import validate_geojson_collection
+from backend.geo_validation import validate_annotation_submission, validate_geojson_collection
 
 
 def feature(geometry, properties=None, feature_id=None):
@@ -96,6 +96,30 @@ def test_feature_limit_is_enforced():
     features = [feature({"type": "Point", "coordinates": [0, 0]}) for _ in range(501)]
     with pytest.raises(ValueError, match="500-feature"):
         validate_geojson_collection(collection(*features), "EPSG:4326")
+
+
+def test_validator_limits_can_be_raised_for_bounded_annotation_submissions():
+    features = [feature({"type": "Point", "coordinates": [0, 0]}, {"category": "building"}) for _ in range(501)]
+    result = validate_annotation_submission(collection(*features), "EPSG:4326")
+    assert result["valid"] is True
+    assert result["feature_count"] == 501
+
+
+def test_submission_validation_accepts_tuple_coordinates_from_shapely_reprojection():
+    polygon = feature({
+        "type": "Polygon",
+        "coordinates": (((0, 0), (1, 0), (1, 1), (0, 1), (0, 0)),),
+    }, {"category": "building"})
+    assert validate_annotation_submission(collection(polygon), "EPSG:4326")["valid"] is True
+
+
+def test_submission_integrity_failure_names_feature_and_issue():
+    invalid = collection(feature(
+        {"type": "Polygon", "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 1], [0, 0]]]},
+        {"category": "building"},
+    ))
+    with pytest.raises(ValueError, match=r"features\[0\].*invalid|features\[0\].*Self-intersection"):
+        validate_annotation_submission(invalid, "EPSG:4326")
 
 
 def test_error_details_are_bounded_but_total_error_count_is_preserved():

@@ -237,6 +237,26 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     assert resolved.status_code == 200, resolved.text
     assert resolved.json()["status"] == "resolved"
 
+    invalid_geometries = [
+        {"type": "Polygon", "coordinates": [[[0, 0], [1, 1], [1, 0], [0, 1], [0, 0]]]},
+        {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1]]]},
+        {"type": "GeometryCollection", "geometries": []},
+        {"type": "Point", "coordinates": [200, 20]},
+    ]
+    for geometry in invalid_geometries:
+        invalid = polygon_collection()
+        invalid["features"][0]["geometry"] = geometry
+        rejected = client.post(
+            f"/work/tasks/{task['id']}/annotations", headers=worker_headers,
+            json={"geojson": invalid},
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "validation failed" in rejected.json()["detail"].lower()
+    with session_factory() as db:
+        from backend.models import Annotation, Task
+        assert db.query(Annotation).filter_by(task_id=task["id"]).count() == 0
+        assert db.query(Task).filter_by(id=task["id"]).one().review_status != "pending_review"
+
     submit = client.post(
         f"/work/tasks/{task['id']}/annotations", headers=worker_headers,
         json={"geojson": polygon_collection()},

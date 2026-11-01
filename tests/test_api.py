@@ -110,6 +110,26 @@ def test_task_lifecycle_and_task_bound_annotator_keys(api_client):
     )
     assert rejected_invalid_geometry.status_code == 400
 
+    invalid_geometries = [
+        {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1]]]},
+        {"type": "GeometryCollection", "geometries": []},
+        {"type": "Point", "coordinates": [200, 20]},
+    ]
+    for geometry in invalid_geometries:
+        invalid_geojson = sample_geojson()
+        invalid_geojson["features"][0]["geometry"] = geometry
+        rejected = client.post(
+            f"/tasks/{task['id']}/annotations",
+            json={"geojson": invalid_geojson},
+            headers=worker_headers,
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "validation failed" in rejected.json()["detail"].lower()
+    with session_factory() as db:
+        from backend.models import Annotation, Task
+        assert db.query(Annotation).filter_by(task_id=task["id"]).count() == 0
+        assert db.query(Task).filter_by(id=task["id"]).one().status != "completed"
+
     submitted = client.post(
         f"/tasks/{task['id']}/annotations",
         json={"geojson": sample_geojson()},

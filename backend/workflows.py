@@ -48,8 +48,8 @@ from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
 from backend.temp_storage import reserve_download
-from backend.geo_utils import reproject_feature_collection
-from backend.geo_validation import validate_geojson_collection
+from backend.geo_utils import get_feature_collection_crs, reproject_feature_collection
+from backend.geo_validation import validate_annotation_submission, validate_geojson_collection
 from backend.inference import (
     MAX_IMAGE_BYTES,
     get_inference_status,
@@ -640,6 +640,10 @@ def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
     if total_mask_bytes > 8_000_000:
         raise HTTPException(status_code=413, detail="Pixel-mask PNG data exceeds the 8 MB per-submission limit.")
     try:
+        validate_annotation_submission(geojson, get_feature_collection_crs(geojson))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         if not masks:
             result = reproject_feature_collection(geojson, task.crs)
         else:
@@ -681,6 +685,10 @@ def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
             raise HTTPException(status_code=400, detail=f"features[{index}].properties.category must match a task taxonomy label.")
         if not isinstance(feature.get("geometry"), dict):
             raise HTTPException(status_code=400, detail=f"features[{index}].geometry must be a geometry object.")
+    try:
+        validate_annotation_submission(result, task.crs)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return result
 
 
