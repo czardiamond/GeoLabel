@@ -42,7 +42,7 @@ from backend.blob_storage import (
     is_configured as blob_storage_configured,
     key_from_pathname,
 )
-from backend.gis_operations import raster_band_statistics, raster_change_analysis, spatial_join
+from backend.gis_operations import raster_band_statistics, raster_change_analysis, raster_zonal_statistics, spatial_join
 from backend.mask_utils import polygonize_png_mask
 from backend.auth import get_current_annotator
 from backend.config import settings
@@ -358,6 +358,38 @@ class RasterChangeRequest(BaseModel):
     second_asset_id: str
     threshold: float | None = Field(default=None, ge=0, le=1e12)
     max_pixels: int = Field(default=2_000_000, ge=1, le=25_000_000)
+
+
+class RasterZonalStatsRequest(BaseModel):
+    zones_geojson: dict
+    zones_crs: str = Field(min_length=1, max_length=256)
+    band: int = Field(default=1, ge=1, le=512)
+    max_pixels: int = Field(default=2_000_000, ge=1, le=25_000_000)
+    all_touched: bool = False
+
+    @field_validator("zones_geojson")
+    @classmethod
+    def bounded_polygon_features(cls, value):
+        if (not isinstance(value, dict) or value.get("type") != "FeatureCollection"
+                or not isinstance(value.get("features"), list) or not value["features"]):
+            raise ValueError("zones_geojson must be a non-empty GeoJSON FeatureCollection")
+        if len(value["features"]) > 500:
+            raise ValueError("zones_geojson may contain at most 500 features")
+        try:
+            encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=True).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("zones_geojson must contain JSON-compatible values") from exc
+        if len(encoded) > 2_000_000:
+            raise ValueError("zones_geojson exceeds the 2 MB analysis request limit")
+        return value
+
+    @field_validator("zones_crs")
+    @classmethod
+    def valid_zones_crs(cls, value):
+        try:
+            return pyproj.CRS.from_user_input(value).to_string()
+        except Exception as exc:
+            raise ValueError("zones_crs must identify a valid coordinate reference system") from exc
 
 
 class VideoSegment(BaseModel):
@@ -1863,6 +1895,24 @@ def get_raster_statistics(asset_id: str, payload: RasterStatsRequest, member: Me
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     audit(db, project.organization_id, member.user_id, "gis.raster_statistics", "asset", asset.id,
           {"max_pixels": payload.max_pixels})
+    db.commit()
+    return {"asset_id": asset.id, **result}
+
+
+@router.post("/assets/{asset_id}/raster/zonal-statistics")
+def get_raster_zonal_statistics(asset_id: str, payload: RasterZonalStatsRequest,
+                                member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    asset, project, path = _analysis_asset(asset_id, member, db)
+    try:
+        result = raster_zonal_statistics(
+            path, payload.zones_geojson, payload.zones_crs, band=payload.band,
+            max_pixels=payload.max_pixels, all_touched=payload.all_touched,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, project.organization_id, member.user_id, "gis.raster_zonal_statistics", "asset", asset.id,
+          {"band": payload.band, "zone_count": len(payload.zones_geojson["features"]),
+           "window_pixels_read": result["window_pixels_read"], "all_touched": payload.all_touched})
     db.commit()
     return {"asset_id": asset.id, **result}
 

@@ -10,7 +10,12 @@ from typing import Any
 
 import numpy as np
 import rasterio
+from rasterio.errors import WindowError
+from rasterio.features import geometry_mask, geometry_window
 from rasterio.windows import Window
+from pyproj import CRS, Transformer
+from shapely import get_coordinates, transform as project_geometry
+from shapely.geometry import mapping, shape
 from backend.spatial_operations import spatial_join
 
 
@@ -150,3 +155,123 @@ def raster_change_analysis(path_a: str | Path, path_b: str | Path,
         raise
     except Exception as exc:
         raise ValueError(f"unable to compare rasters: {exc}") from exc
+
+
+def raster_zonal_statistics(path: str | Path, zones: dict[str, Any], zones_crs: str,
+                            band: int = 1, max_pixels: int = 2_000_000,
+                            all_touched: bool = False) -> dict[str, Any]:
+    """Summarize one raster band inside polygon zones using pixel-window reads.
+
+    Pixels are included when their centers fall inside each zone by default;
+    ``all_touched=True`` includes every pixel touched by a zone boundary. The
+    total area of raster windows read across all zones is bounded by max_pixels.
+    """
+    if not isinstance(max_pixels, int) or max_pixels <= 0:
+        raise ValueError("max_pixels must be a positive integer")
+    if not isinstance(band, int) or band <= 0:
+        raise ValueError("band must be a positive integer")
+    if not isinstance(zones_crs, str) or not zones_crs.strip():
+        raise ValueError("zones CRS is required; CRS will not be guessed")
+    if not isinstance(zones, dict) or zones.get("type") != "FeatureCollection":
+        raise ValueError("zones must be a GeoJSON FeatureCollection")
+    features = zones.get("features")
+    if not isinstance(features, list) or not features:
+        raise ValueError("zones FeatureCollection must contain at least one polygon feature")
+
+    try:
+        zone_crs = CRS.from_user_input(zones_crs)
+    except Exception as exc:
+        raise ValueError(f"Invalid zones CRS: {zones_crs!r}") from exc
+
+    parsed_zones = []
+    for index, feature in enumerate(features):
+        if not isinstance(feature, dict) or feature.get("type") != "Feature":
+            raise ValueError(f"zones feature {index} is malformed")
+        geometry = feature.get("geometry")
+        if not isinstance(geometry, dict):
+            raise ValueError(f"zones feature {index} has malformed geometry")
+        try:
+            geom = shape(geometry)
+            coords = get_coordinates(geom)
+        except Exception as exc:
+            raise ValueError(f"zones feature {index} has malformed geometry") from exc
+        if geom.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise ValueError(f"zones feature {index} must be a Polygon or MultiPolygon")
+        if geom.is_empty or not geom.is_valid or not len(coords) or not np.isfinite(coords[:, :2]).all():
+            raise ValueError(f"zones feature {index} has invalid or non-finite geometry")
+        properties = feature.get("properties", {})
+        if properties is None:
+            properties = {}
+        if not isinstance(properties, dict):
+            raise ValueError(f"zones feature {index} properties must be an object")
+        parsed_zones.append((index, geom, properties))
+
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"raster path does not exist or is not a file: {path}")
+    try:
+        with rasterio.open(path) as dataset:
+            if dataset.crs is None:
+                raise ValueError("raster has no CRS; zonal statistics requires an explicit raster CRS")
+            if band > dataset.count:
+                raise ValueError(f"band must be between 1 and {dataset.count}")
+            transformer = None if zone_crs.equals(dataset.crs) else Transformer.from_crs(
+                zone_crs, dataset.crs, always_xy=True
+            )
+            summaries = []
+            pixels_read = 0
+            for index, geom, properties in parsed_zones:
+                if transformer is not None:
+                    geom = project_geometry(geom, transformer.transform, interleaved=False)
+                    coords = get_coordinates(geom)
+                    if geom.is_empty or not geom.is_valid or not len(coords) or not np.isfinite(coords[:, :2]).all():
+                        raise ValueError(f"zones feature {index} becomes invalid when transformed to raster CRS")
+                count, mean, m2, low, high, total_sum = 0, 0.0, 0.0, None, None, 0.0
+                try:
+                    window = geometry_window(dataset, [mapping(geom)])
+                except WindowError:
+                    window = None
+                if window is not None:
+                    window_pixels = int(window.width) * int(window.height)
+                    pixels_read += window_pixels
+                    if pixels_read > max_pixels:
+                        raise ValueError(
+                            f"zonal raster windows contain {pixels_read} pixels, exceeding max_pixels={max_pixels}"
+                        )
+                    raster_values = dataset.read(band, window=window, masked=True)
+                    inside = geometry_mask(
+                        [mapping(geom)],
+                        out_shape=(int(window.height), int(window.width)),
+                        transform=dataset.window_transform(window),
+                        all_touched=all_touched,
+                        invert=True,
+                    )
+                    valid = inside & ~np.ma.getmaskarray(raster_values)
+                    raw = np.asarray(raster_values.data, dtype="float64")
+                    valid &= np.isfinite(raw)
+                    values = raw[valid]
+                    count, mean, m2, low, high = _merge_moments(count, mean, m2, low, high, values)
+                    if values.size:
+                        total_sum = float(values.sum(dtype="float64"))
+                summaries.append({
+                    "zone_index": index,
+                    "properties": properties,
+                    "valid_pixel_count": count,
+                    "min": low,
+                    "max": high,
+                    "mean": mean if count else None,
+                    "sum": total_sum if count else None,
+                    "std": float(np.sqrt(max(0.0, m2 / count))) if count else None,
+                })
+            return {
+                "crs": dataset.crs.to_string(),
+                "zones_crs": zone_crs.to_string(),
+                "band": band,
+                "all_touched": all_touched,
+                "window_pixels_read": pixels_read,
+                "zones": summaries,
+            }
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"unable to calculate raster zonal statistics: {exc}") from exc

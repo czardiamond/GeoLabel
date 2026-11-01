@@ -42,6 +42,21 @@ def test_spatial_join_and_raster_analysis_are_role_checked_and_grid_safe(api_cli
     assert stats.json()["width"] == 4 and stats.json()["height"] == 4
     assert stats.json()["bands"][0]["valid_pixel_count"] == 16
     assert stats.json()["bands"][0]["mean"] == 100.0
+    zones = {
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {"name": "northwest"}, "geometry": {
+            "type": "Polygon", "coordinates": [[[-1, 1], [0, 1], [0, 0], [-1, 0], [-1, 1]]],
+        }}],
+    }
+    zonal = client.post(f"/assets/{first.json()['id']}/raster/zonal-statistics", headers=owner_headers,
+                        json={"zones_geojson": zones, "zones_crs": "EPSG:4326", "max_pixels": 16})
+    assert zonal.status_code == 200, zonal.text
+    assert zonal.json()["zones"][0]["valid_pixel_count"] == 4
+    assert zonal.json()["zones"][0]["mean"] == 100.0
+    assert zonal.json()["zones"][0]["properties"] == {"name": "northwest"}
+    bad_zone_crs = client.post(f"/assets/{first.json()['id']}/raster/zonal-statistics", headers=owner_headers,
+                               json={"zones_geojson": zones, "zones_crs": "not-a-crs"})
+    assert bad_zone_crs.status_code == 422
     too_large = client.post(f"/assets/{first.json()['id']}/raster/statistics", headers=owner_headers,
                             json={"max_pixels": 4})
     assert too_large.status_code == 422
@@ -120,6 +135,19 @@ def test_spatial_join_and_raster_analysis_are_role_checked_and_grid_safe(api_cli
     worker_headers = {"Authorization": f"Bearer {accepted.json()['access_token']}"}
     denied = client.post(f"/assets/{first.json()['id']}/raster/statistics", headers=worker_headers, json={})
     assert denied.status_code == 403
+    denied_zonal = client.post(f"/assets/{first.json()['id']}/raster/zonal-statistics", headers=worker_headers,
+                               json={"zones_geojson": zones, "zones_crs": "EPSG:4326"})
+    assert denied_zonal.status_code == 403
+    analyst_invite = client.post(f"/organizations/{org['id']}/invitations", headers=owner_headers,
+                                 json={"email": "gis-analyst@example.com", "role": "analyst"})
+    analyst = client.post("/auth/invitations/accept", json={
+        "token": analyst_invite.json()["token"], "display_name": "GIS Analyst",
+        "password": "correct-horse-battery-9",
+    })
+    analyst_headers = {"Authorization": f"Bearer {analyst.json()['access_token']}"}
+    analyst_zonal = client.post(f"/assets/{first.json()['id']}/raster/zonal-statistics", headers=analyst_headers,
+                                json={"zones_geojson": zones, "zones_crs": "EPSG:4326", "max_pixels": 16})
+    assert analyst_zonal.status_code == 200, analyst_zonal.text
     worker_validation = client.post(f"/organizations/{org['id']}/gis/validate", headers=worker_headers, json={
         "geojson": collection,
         "crs": "EPSG:4326",

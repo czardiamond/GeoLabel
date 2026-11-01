@@ -57,6 +57,7 @@ Local uploads stream to disk and use `MAX_ASSET_UPLOAD_MB` (default 512 MiB). Ve
 - Contributor tools include bounded undo/redo (100 snapshots) for image features and video tracks, B/P/L/O/K/M drawing shortcuts, Escape cancellation, versioned server autosave and draft recovery, and read-only submitted revision timelines with copy-to-draft. Drafts and accepted submissions preserve existing task CRS and GeoJSON behavior.
 - Annotation submission remains GeoJSON-first and preserves the task CRS and existing reprojection behavior.
 - Reviewer queue with explicit accept/reject/rework decisions. A rework resubmission replaces the current annotation while a prior version is retained in `annotation_revisions`.
+- Reviewers can switch the source-image overlay between each worker's submitted GeoJSON and the majority-supported consensus; the submitted GeoJSON remains available as a collapsible inspection view. Overlays are a visual comparison aid, not proof that one submission is correct.
 - Task discussion comments and issue records, in-app notifications, and notification read state.
 - Reviewer-supplied gold FeatureCollections and per-worker precision, recall, F1, and category accuracy; quality can be used to filter the task queue.
 - Organization reviewers can inspect majority-supported consensus GeoJSON and inter-annotator agreement from the independent submissions; a consensus requires at least two annotations and uses the existing heuristic spatial matching/support threshold.
@@ -171,6 +172,7 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `GET` | `/work/tasks/{id}/consensus` | Owner/admin/reviewer/analyst | Majority-supported GeoJSON and inter-annotator agreement |
 | `POST` | `/organizations/{id}/gis/spatial-join` | Owner/admin/reviewer/analyst | CRS-aware local GeoJSON spatial join |
 | `POST` | `/assets/{id}/raster/statistics` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF band statistics |
+| `POST` | `/assets/{id}/raster/zonal-statistics` | Owner/admin/reviewer/analyst | CRS-aware per-polygon summaries (count, min, max, mean, sum, standard deviation) for one local GeoTIFF band |
 | `POST` | `/organizations/{id}/gis/raster-change` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF change analysis |
 | `POST` / `GET` | `/work/tasks/{id}/preannotations` | Reviewer/admin / task member | Import/list reviewable provider suggestions |
 | `POST` | `/work/preannotations/{id}/decision` | Reviewer/admin | Accept/reject a suggestion |
@@ -198,7 +200,7 @@ npm run lint
 npm run build
 ```
 
-The tests exercise legacy compatibility and migrations, organization isolation, GeoTIFF/world-file ingestion and repair, source-pixel masks and CRS polygonization, private media and multi-worker assignment, independent submissions, scorer provenance, login throttling, GIS joins/statistics/change, export secret exclusion, local readiness, SQLite/media backup integrity, review/rework, versioned draft recovery, undo/redo and interpolation utilities, video keyframe validation/duration/history, inference-disabled status, and notifications.
+The tests exercise legacy compatibility and migrations, organization isolation, GeoTIFF/world-file ingestion and repair, source-pixel masks and CRS polygonization, private media and multi-worker assignment, independent submissions, scorer provenance, login throttling, GIS joins/statistics/change/zonal analysis, export secret exclusion, local readiness, SQLite/media backup integrity, review/rework, versioned draft recovery, undo/redo and interpolation utilities, video keyframe validation/duration/history, inference-disabled status, and notifications.
 
 The official-documentation behavior comparison is recorded in [`docs/competitor-workflow-comparison.md`](docs/competitor-workflow-comparison.md). GeoLabel implements comparable contributor workflow patterns, not the competitors' proprietary code or branding; provider/model-dependent functions remain explicitly unavailable until configured and authorized.
 
@@ -209,7 +211,7 @@ The official-documentation behavior comparison is recorded in [`docs/competitor-
 - Define retention periods, legal holds, deletion/restore behavior, and export policy before automated retention or destructive deletion. The local backup utility is SQLite-only and unencrypted; production backups need provider-native tooling and tested restore drills.
 - Add malware scanning, invitation abuse controls, session/key rotation, egress restrictions, production CORS, HTTPS termination, quotas, monitoring, and incident response.
 - Choose an approved vision model/provider or self-hosted runtime, provide credentials/compute and data-transfer approval, and evaluate it before automatic image labeling, tracking, segmentation, or video understanding. No inference credentials are configured here.
-- Pixel-level masks, geocoding, and independently validated quality guarantees need the respective editor, geocoder, and representative verified datasets. Current local GIS covers vector spatial joins and bounded raster statistics/change analysis only.
+- Pixel-level masks, geocoding, and independently validated quality guarantees need the respective editor, geocoder, and representative verified datasets. Current local GIS covers vector spatial joins, bounded raster statistics/change, and per-zone summaries; it does not provide general raster algebra, tiled processing, or derived raster outputs.
 - Decide who may create organizations with the deployment service key; benchmark and independently validate geospatial metrics and consensus thresholds on representative imagery/CRS data.
 
 No billing provider is configured by this code, and it neither charges users nor claims billing as a peer-product feature.
