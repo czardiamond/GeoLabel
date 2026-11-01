@@ -52,6 +52,37 @@ def test_normalized_pixel_suggestions_use_asset_affine_and_reject_unsafe_output(
         raise AssertionError("provider labels outside the task taxonomy must be rejected")
 
 
+def test_provider_output_rejects_malformed_labels_types_and_coordinates():
+    from backend.inference import MAX_COORDINATE_NESTING
+
+    valid_geometry = {"type": "Point", "coordinates": [0.25, 0.5]}
+    malformed_candidates = [
+        ({"category": ["tree"], "geometry": valid_geometry}, "exact task taxonomy"),
+        ({"category": "tree", "geometry": {"type": ["Point"], "coordinates": [0.25, 0.5]}},
+         "unsupported geometry type"),
+        ({"category": "tree", "geometry": {"type": "Point", "coordinates": [0.25, 0.5, 0.75]}},
+         "nested numeric arrays"),
+    ]
+    too_deep = [0.25, 0.5]
+    for _ in range(MAX_COORDINATE_NESTING + 1):
+        too_deep = [too_deep]
+    malformed_candidates.append((
+        {"category": "tree", "geometry": {"type": "Point", "coordinates": too_deep}},
+        "nesting depth",
+    ))
+
+    for feature, expected_message in malformed_candidates:
+        try:
+            normalize_pixel_suggestions(
+                {"features": [feature]}, taxonomy=["tree"], width=4, height=3,
+                affine_transform=[2, 0, 10, 0, -2, 20], bounds=[10, 14, 18, 20],
+            )
+        except ValueError as exc:
+            assert expected_message in str(exc)
+        else:
+            raise AssertionError(f"malformed provider output must be rejected: {feature!r}")
+
+
 def test_ai_suggestions_require_deployment_and_task_consent_and_remain_pending(api_client, tmp_path, monkeypatch):
     client, session_factory = api_client
     from backend.config import settings
@@ -289,3 +320,27 @@ def test_pinned_provider_http_streams_and_caps_response_bytes(monkeypatch):
         assert "safety limit" in str(exc)
     else:
         raise AssertionError("oversized provider responses must be rejected")
+
+
+def test_vision_adapter_rejects_excessively_nested_provider_json(monkeypatch):
+    import json
+    from backend.inference import ProviderConfig, request_provider_suggestions
+
+    deeply_nested_json = "[" * 16_000 + "0" + "]" * 16_000
+    provider_response = json.dumps({"choices": [{"message": {"content": deeply_nested_json}}]}).encode()
+    monkeypatch.setattr("backend.inference._resolve_public_provider_dns", lambda _host: ("8.8.8.8",))
+    monkeypatch.setattr("backend.inference._post_pinned_provider_request", lambda *_args: provider_response)
+    provider = ProviderConfig(
+        base_url="https://approved.example.test/v1", host="approved.example.test",
+        model="vision-test-model", api_key="server-only-key",
+    )
+
+    try:
+        request_provider_suggestions(
+            _png(), config=provider, taxonomy=["tree"], width=4, height=3,
+            affine_transform=[2, 0, 10, 0, -2, 20], bounds=[10, 14, 18, 20], source_crs="EPSG:4326",
+        )
+    except ValueError as exc:
+        assert "valid supported GeoLabel suggestion JSON" in str(exc)
+    else:
+        raise AssertionError("excessively nested provider JSON must be rejected")

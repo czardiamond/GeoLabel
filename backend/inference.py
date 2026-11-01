@@ -29,6 +29,7 @@ MAX_IMAGE_BYTES = 20_000_000
 MAX_PROVIDER_RESPONSE_BYTES = 2_000_000
 MAX_PROVIDER_FEATURES = 200
 MAX_PROVIDER_COORDINATES = 50_000
+MAX_COORDINATE_NESTING = 8
 SUPPORTED_GEOMETRIES = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
 
 
@@ -265,7 +266,7 @@ def request_provider_suggestions(image_bytes: bytes, *, config: ProviderConfig,
     try:
         body = json.loads(response_bytes)
         decoded = json.loads(_response_text(body))
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError) as exc:
         raise ValueError("Provider response was not valid supported GeoLabel suggestion JSON.") from exc
     return normalize_pixel_suggestions(
         decoded, taxonomy=taxonomy, width=width, height=height,
@@ -273,10 +274,12 @@ def request_provider_suggestions(image_bytes: bytes, *, config: ProviderConfig,
     )
 
 
-def _coordinate_to_asset_crs(value, affine: Affine, width: int, height: int, counter: list[int]):
+def _coordinate_to_asset_crs(value, affine: Affine, width: int, height: int, counter: list[int], depth: int = 0):
+    if depth > MAX_COORDINATE_NESTING:
+        raise ValueError("Provider geometry coordinates exceed the supported nesting depth.")
     if not isinstance(value, (list, tuple)):
         raise ValueError("Provider geometry coordinates must be nested numeric arrays.")
-    if len(value) >= 2 and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value[:2]):
+    if len(value) == 2 and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
         x, y = float(value[0]), float(value[1])
         if not math.isfinite(x) or not math.isfinite(y) or not 0 <= x <= 1 or not 0 <= y <= 1:
             raise ValueError("Provider coordinates must be finite normalized pixel-edge values in [0,1].")
@@ -285,7 +288,7 @@ def _coordinate_to_asset_crs(value, affine: Affine, width: int, height: int, cou
             raise ValueError("Provider response contains too many geometry coordinates.")
         gx, gy = affine @ (x * width, y * height)
         return [gx, gy]
-    return [_coordinate_to_asset_crs(item, affine, width, height, counter) for item in value]
+    return [_coordinate_to_asset_crs(item, affine, width, height, counter, depth + 1) for item in value]
 
 
 def normalize_pixel_suggestions(payload: dict, *, taxonomy: list[str], width: int, height: int,
@@ -323,13 +326,15 @@ def normalize_pixel_suggestions(payload: dict, *, taxonomy: list[str], width: in
     total_coordinates = [0]
     allowed_labels = set(taxonomy)
     for index, candidate in enumerate(features):
-        if not isinstance(candidate, dict) or candidate.get("category") not in allowed_labels:
+        category = candidate.get("category") if isinstance(candidate, dict) else None
+        if not isinstance(category, str) or category not in allowed_labels:
             raise ValueError(f"Provider feature {index} must use one exact task taxonomy label.")
         geometry = candidate.get("geometry")
-        if not isinstance(geometry, dict) or geometry.get("type") not in SUPPORTED_GEOMETRIES:
+        geometry_type = geometry.get("type") if isinstance(geometry, dict) else None
+        if not isinstance(geometry_type, str) or geometry_type not in SUPPORTED_GEOMETRIES:
             raise ValueError(f"Provider feature {index} has an unsupported geometry type.")
         coordinates = _coordinate_to_asset_crs(geometry.get("coordinates"), affine, width, height, total_coordinates)
-        converted = {"type": geometry["type"], "coordinates": coordinates}
+        converted = {"type": geometry_type, "coordinates": coordinates}
         try:
             parsed_geometry = shape(converted)
         except Exception as exc:
