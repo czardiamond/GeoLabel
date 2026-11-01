@@ -7,7 +7,7 @@ type RasterAsset = {
   name?: string;
   kind?: string;
   crs?: string;
-  metadata?: { driver?: string };
+  metadata?: { driver?: string; acquisition_date?: string };
 };
 type Props = {
   assets: RasterAsset[];
@@ -27,6 +27,10 @@ function errorText(error: unknown) {
 
 function displayName(asset?: RasterAsset) {
   return asset?.filename || asset?.name || asset?.id || 'Raster';
+}
+
+function displayRasterName(asset?: RasterAsset) {
+  return `${displayName(asset)}${asset?.metadata?.acquisition_date ? ` · ${asset.metadata.acquisition_date}` : ''}`;
 }
 
 function formatNumber(value: unknown) {
@@ -75,6 +79,11 @@ export function RasterAnalysisPanel({ assets, organizationId, request }: Props) 
     setBusy(true);
     resetResult();
     try {
+      const firstDate = rasters.find(asset => asset.id === firstAssetId)?.metadata?.acquisition_date;
+      const secondDate = rasters.find(asset => asset.id === secondAssetId)?.metadata?.acquisition_date;
+      if (firstDate && secondDate && firstDate > secondDate) {
+        throw new Error('The selected baseline date is later than the comparison date. Reverse the selected rasters.');
+      }
       const body: Record<string, unknown> = { first_asset_id: firstAssetId, second_asset_id: secondAssetId, max_pixels: maxPixels };
       if (threshold.trim()) {
         const parsed = Number(threshold);
@@ -144,9 +153,9 @@ export function RasterAnalysisPanel({ assets, organizationId, request }: Props) 
 
     {rasters.length === 0 ? <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-900">No GeoTIFF is loaded in the selected dataset. Go to Overview, open a dataset, and upload a GeoTIFF first.</p> : <>
       {mode === 'compare' && <form onSubmit={runComparison} className="grid gap-3 lg:grid-cols-2">
-        <div className="rounded-lg bg-indigo-50 p-3 text-sm text-indigo-950 lg:col-span-2"><b>Compare an earlier and a later raster.</b> Select the temporal order yourself; dates are not inferred from filenames. GeoLabel compares the original pixel grids only—there is no reprojection, resampling, or alignment correction.</div>
-        <label className="block text-sm font-medium">Earlier raster (baseline)<select className={`${inputClass} mt-1`} value={firstAssetId} onChange={event => { setFirstAssetId(event.target.value); resetResult(); }} required><option value="">Choose baseline GeoTIFF</option>{rasters.filter(asset => asset.id !== secondAssetId).map(asset => <option key={asset.id} value={asset.id}>{displayName(asset)} · {asset.crs || 'CRS unavailable'}</option>)}</select></label>
-        <label className="block text-sm font-medium">Later raster (comparison)<select className={`${inputClass} mt-1`} value={secondAssetId} onChange={event => { setSecondAssetId(event.target.value); resetResult(); }} required><option value="">Choose later GeoTIFF</option>{rasters.filter(asset => asset.id !== firstAssetId).map(asset => <option key={asset.id} value={asset.id}>{displayName(asset)} · {asset.crs || 'CRS unavailable'}</option>)}</select></label>
+        <div className="rounded-lg bg-indigo-50 p-3 text-sm text-indigo-950 lg:col-span-2"><b>Compare an earlier and a later raster.</b> When both assets have analyst-verified acquisition dates, GeoLabel checks the order; otherwise, choose the temporal order yourself. Dates are never inferred from filenames. The original pixel grids must match exactly—there is no reprojection, resampling, or alignment correction.</div>
+        <label className="block text-sm font-medium">Earlier raster (baseline)<select className={`${inputClass} mt-1`} value={firstAssetId} onChange={event => { setFirstAssetId(event.target.value); resetResult(); }} required><option value="">Choose baseline GeoTIFF</option>{rasters.filter(asset => asset.id !== secondAssetId).map(asset => <option key={asset.id} value={asset.id}>{displayRasterName(asset)} · {asset.crs || 'CRS unavailable'}</option>)}</select></label>
+        <label className="block text-sm font-medium">Later raster (comparison)<select className={`${inputClass} mt-1`} value={secondAssetId} onChange={event => { setSecondAssetId(event.target.value); resetResult(); }} required><option value="">Choose later GeoTIFF</option>{rasters.filter(asset => asset.id !== firstAssetId).map(asset => <option key={asset.id} value={asset.id}>{displayRasterName(asset)} · {asset.crs || 'CRS unavailable'}</option>)}</select></label>
         <label className="block text-sm font-medium">Change threshold (optional)<input className={`${inputClass} mt-1`} type="number" min="0" step="any" value={threshold} onChange={event => { setThreshold(event.target.value); resetResult(); }} placeholder="e.g. 5"/><span className="mt-1 block text-xs font-normal text-slate-500">When set, pixels with absolute difference greater than this value are counted. Interpret thresholds using the source band units.</span></label>
         <label className="block text-sm font-medium">Maximum raster pixels<input className={`${inputClass} mt-1`} type="number" min="1" max={MAX_PIXELS} step="1" value={maxPixels} onChange={event => { setMaxPixels(Number(event.target.value)); resetResult(); }} required/><span className="mt-1 block text-xs font-normal text-slate-500">Server limit: {MAX_PIXELS.toLocaleString()} pixels per request.</span></label>
         {error && <p className="rounded-lg bg-red-50 p-3 text-sm text-red-800 lg:col-span-2" role="alert">{error}</p>}
@@ -176,7 +185,7 @@ export function RasterAnalysisPanel({ assets, organizationId, request }: Props) 
 
     {result && <div className="mt-5 border-t pt-4">
       {mode === 'compare' && <>
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-semibold">Raster comparison results</h3><p className="text-xs text-slate-500">{displayName(rasters.find(asset => asset.id === result.first_asset_id))} → {displayName(rasters.find(asset => asset.id === result.second_asset_id))} · {result.crs || 'CRS unavailable'} · {result.width} × {result.height} pixels{result.threshold == null ? '' : ` · changed-pixel threshold ${result.threshold}`}</p></div><button className={secondaryClass} onClick={() => downloadJson(result, `geolabel-raster-change-${result.first_asset_id}-${result.second_asset_id}.json`)}><Download size={15}/>Download JSON</button></div>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><div><h3 className="font-semibold">Raster comparison results</h3><p className="text-xs text-slate-500">{displayRasterName(rasters.find(asset => asset.id === result.first_asset_id))} → {displayRasterName(rasters.find(asset => asset.id === result.second_asset_id))} · {result.crs || 'CRS unavailable'} · {result.width} × {result.height} pixels{result.threshold == null ? '' : ` · changed-pixel threshold ${result.threshold}`}</p></div><button className={secondaryClass} onClick={() => downloadJson(result, `geolabel-raster-change-${result.first_asset_id}-${result.second_asset_id}.json`)}><Download size={15}/>Download JSON</button></div>
         <div className="overflow-x-auto"><table className="w-full min-w-[700px] border-collapse text-left text-sm"><thead><tr className="border-b text-xs uppercase text-slate-500"><th className="p-2">Band</th><th className="p-2">Valid pixels</th><th className="p-2">Min absolute difference</th><th className="p-2">Max</th><th className="p-2">Mean</th><th className="p-2">Std dev</th>{result.threshold != null && <><th className="p-2">Changed pixels</th><th className="p-2">Changed bounds</th></>}</tr></thead><tbody>{result.bands.map((item: any) => <tr key={item.band} className="border-b"><td className="p-2">{item.band}</td><td className="p-2">{Number(item.valid_pixel_count).toLocaleString()}</td><td className="p-2">{formatNumber(item.min)}</td><td className="p-2">{formatNumber(item.max)}</td><td className="p-2">{formatNumber(item.mean)}</td><td className="p-2">{formatNumber(item.std)}</td>{result.threshold != null && <><td className="p-2">{Number(item.changed_pixel_count || 0).toLocaleString()}</td><td className="p-2 font-mono text-xs">{item.changed_bounds ? JSON.stringify(item.changed_bounds) : '—'}</td></>}</tr>)}</tbody></table></div>
         <p className="mt-2 text-xs text-slate-500">Differences are absolute numeric pixel values; they do not establish semantic change or physical units. No-data pixels are excluded. Comparisons require identical dimensions, band counts, CRS, and affine transform; no resampling is performed.</p>
       </>}

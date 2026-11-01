@@ -10,7 +10,7 @@ import socket
 import tempfile
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -307,6 +307,10 @@ class GeoreferenceRepair(BaseModel):
         if not all(math.isfinite(item) for item in clean) or clean[0] >= clean[2] or clean[1] >= clean[3]:
             raise ValueError("bounds must be finite [xmin, ymin, xmax, ymax] with positive area")
         return clean
+
+
+class AcquisitionDateUpdate(BaseModel):
+    acquisition_date: date | None
 
 
 class SpatialJoinRequest(BaseModel):
@@ -1848,6 +1852,37 @@ def repair_asset_georeference(asset_id: str, payload: GeoreferenceRepair, member
     asset.metadata_json = json.dumps(metadata, separators=(",", ":"))
     audit(db, project.organization_id, member.user_id, "asset.georeference.repaired", "asset", asset.id,
           {"previous": old, "crs": payload.crs, "bounds": payload.bounds, "rationale": payload.rationale.strip()})
+    db.commit()
+    db.refresh(asset)
+    return _asset_response(asset)
+
+
+@router.patch("/assets/{asset_id}/acquisition-date")
+def update_asset_acquisition_date(asset_id: str, payload: AcquisitionDateUpdate,
+                                  member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found.")
+    _, project = _dataset_for_member(db, asset.dataset_id, member)
+    membership = membership_for(db, member.user_id, project.organization_id)
+    require_roles(membership, "owner", "admin", "reviewer")
+    metadata = asset.asset_metadata or {}
+    previous = metadata.get("acquisition_date")
+    if payload.acquisition_date is None:
+        metadata.pop("acquisition_date", None)
+        metadata.pop("acquisition_date_source", None)
+        metadata.pop("acquisition_date_updated_at", None)
+        metadata.pop("acquisition_date_updated_by", None)
+    else:
+        metadata["acquisition_date"] = payload.acquisition_date.isoformat()
+        metadata["acquisition_date_source"] = "user_verified"
+        metadata["acquisition_date_updated_at"] = utcnow_naive().isoformat()
+        metadata["acquisition_date_updated_by"] = member.user_id
+    asset.metadata_json = json.dumps(metadata, separators=(",", ":"))
+    audit(
+        db, project.organization_id, member.user_id, "asset.acquisition_date.updated", "asset", asset.id,
+        {"previous": previous, "acquisition_date": payload.acquisition_date.isoformat() if payload.acquisition_date else None},
+    )
     db.commit()
     db.refresh(asset)
     return _asset_response(asset)

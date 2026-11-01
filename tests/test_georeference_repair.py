@@ -25,6 +25,21 @@ def test_georeference_repair_is_audited_and_stops_after_task_link(api_client, tm
     assert uploaded.status_code == 201, uploaded.text
     asset_id = uploaded.json()["id"]
 
+    dated = client.patch(f"/assets/{asset_id}/acquisition-date", headers=owner_headers,
+                         json={"acquisition_date": "2025-06-18"})
+    assert dated.status_code == 200, dated.text
+    assert dated.json()["metadata"]["acquisition_date"] == "2025-06-18"
+    assert dated.json()["metadata"]["acquisition_date_source"] == "user_verified"
+    invalid_date = client.patch(f"/assets/{asset_id}/acquisition-date", headers=owner_headers,
+                                json={"acquisition_date": "2025-02-31"})
+    assert invalid_date.status_code == 422
+    cleared = client.patch(f"/assets/{asset_id}/acquisition-date", headers=owner_headers,
+                           json={"acquisition_date": None})
+    assert cleared.status_code == 200, cleared.text
+    assert "acquisition_date" not in cleared.json()["metadata"]
+    with session_factory() as db:
+        assert db.query(AuditEvent).filter(AuditEvent.action == "asset.acquisition_date.updated").count() == 2
+
     worldfile_image = BytesIO()
     Image.new("RGB", (8, 8), (90, 100, 110)).save(worldfile_image, format="PNG")
     worldfile_upload = client.post(
