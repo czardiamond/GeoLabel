@@ -2,6 +2,7 @@ from io import BytesIO
 
 import numpy as np
 import rasterio
+from PIL import Image
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
@@ -36,6 +37,57 @@ def geotiff_bytes():
             dataset.write(np.full((3, 4, 4), 100, dtype="uint8"))
         output.write(mem.read())
     return output.getvalue()
+
+
+def geotiff_uint16_masked_bytes():
+    height, width = 12, 16
+    bands = np.stack([
+        np.arange(1, height * width + 1, dtype=np.uint16).reshape(height, width),
+        np.arange(100, 100 + height * width, dtype=np.uint16).reshape(height, width),
+        np.zeros((height, width), dtype=np.uint16),
+    ])
+    bands[0, 0, :] = 0
+    bands[1, :, 0] = 0
+    output = BytesIO()
+    with MemoryFile() as mem:
+        with mem.open(
+            driver="GTiff", width=width, height=height, count=3, dtype="uint16", nodata=0,
+            crs="EPSG:32631", transform=from_origin(500000, 800000, 10, 10),
+        ) as dataset:
+            dataset.write(bands)
+        output.write(mem.read())
+    return output.getvalue()
+
+
+def test_uint16_masked_geotiff_upload_serves_generated_preview(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "uint16-assets"))
+    organization, _, owner_headers = create_org_and_owner(client, "Satellite review", "uint16-owner@example.com")
+    project = client.post(f"/organizations/{organization['id']}/projects", headers=owner_headers,
+                          json={"name": "Sentinel scenes", "description": ""})
+    assert project.status_code == 201, project.text
+    dataset = client.post(f"/projects/{project.json()['id']}/datasets", headers=owner_headers,
+                          json={"name": "Sentinel-2", "description": ""})
+    assert dataset.status_code == 201, dataset.text
+
+    upload = client.post(
+        f"/datasets/{dataset.json()['id']}/assets",
+        headers=owner_headers,
+        files={"file": ("sentinel2_uint16.tif", geotiff_uint16_masked_bytes(), "image/tiff")},
+    )
+    assert upload.status_code == 201, upload.text
+    asset = upload.json()
+    assert asset["crs"] == "EPSG:32631"
+    assert asset["bounds"] == [500000.0, 799880.0, 500160.0, 800000.0]
+
+    preview = client.get(asset["preview_path"], headers=owner_headers)
+    assert preview.status_code == 200
+    assert preview.headers["content-type"] == "image/png"
+    with Image.open(BytesIO(preview.content)) as image:
+        assert image.mode == "RGB"
+        assert image.size == (16, 12)
 
 
 def polygon_collection(category="building", shift=0.0):

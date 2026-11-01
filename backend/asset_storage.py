@@ -119,8 +119,10 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
         bands = dataset.read(indexes, out_shape=(len(indexes), out_height, out_width), resampling=Resampling.average, masked=True)
         image_bands = []
         for band in bands:
-            values = np.asarray(band.filled(np.nan), dtype=np.float32)
-            finite = values[np.isfinite(values)]
+            # Keep the mask separate: filling a masked integer array with NaN raises a dtype error.
+            values = np.asarray(band.data, dtype=np.float64)
+            valid = np.isfinite(values) & ~np.ma.getmaskarray(band)
+            finite = values[valid]
             if not finite.size:
                 image_bands.append(np.zeros(values.shape, dtype=np.uint8))
                 continue
@@ -129,7 +131,8 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
                 low, high = float(np.nanmin(finite)), float(np.nanmax(finite))
             if high <= low:
                 high = low + 1.0
-            scaled = (np.nan_to_num(values, nan=low) - low) * (255.0 / (high - low))
+            safe_values = np.where(valid, values, low)
+            scaled = (safe_values - low) * (255.0 / (high - low))
             image_bands.append(np.clip(scaled, 0, 255).astype(np.uint8))
         if len(image_bands) == 1:
             preview = Image.fromarray(image_bands[0], mode="L").convert("RGB")
