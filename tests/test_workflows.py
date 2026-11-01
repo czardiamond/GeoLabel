@@ -196,6 +196,10 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     assert quality.json()["available"] is True
     assert quality.json()["macro_f1"] == 1.0
     assert quality.json()["annotators"][0]["category_accuracy"] == 1.0
+    assert quality.json()["annotators"][0]["precision"] == 1.0
+    assert quality.json()["annotators"][0]["recall"] == 1.0
+    assert quality.json()["annotators"][0]["f1"] == 1.0
+    assert quality.json()["annotators"][0]["per_class"][0]["f1"] == 1.0
 
     analyst_invite = client.post(f"/organizations/{org_id}/invitations", headers=owner_headers,
                                  json={"email": "analyst@example.com", "role": "analyst"})
@@ -361,7 +365,12 @@ def test_review_diagnostics_are_feature_level_bounded_and_reviewer_only(api_clie
     assert gold.json()["available"] is True
     assert gold.json()["reference_source"] == "independent_gold_reference"
     assert gold.json()["scorer_configuration"]["iou_threshold"] == 0.5
+    assert gold.json()["scorer_version"] == "geolabel-reference-agreement-v2"
+    assert gold.json()["crs"] == "EPSG:4326"
     assert all(row["diagnostics"][0]["status"] == "category_mismatch" for row in gold.json()["submissions"])
+    assert all(row["agreement"]["geometry_matches"] == 1 for row in gold.json()["submissions"])
+    assert all(row["agreement"]["category_mismatches"] == 1 for row in gold.json()["submissions"])
+    assert all(row["agreement"]["f1"] == 0.0 for row in gold.json()["submissions"])
 
     consensus = client.get(
         f"/work/tasks/{task['id']}/review-diagnostics?reference=consensus", headers=owner_headers,
@@ -374,6 +383,7 @@ def test_review_diagnostics_are_feature_level_bounded_and_reviewer_only(api_clie
     existing_consensus = client.get(f"/work/tasks/{task['id']}/consensus", headers=owner_headers)
     assert consensus.json()["iaa_score"] == existing_consensus.json()["iaa_score"]
     assert all(row["diagnostics"][0]["status"] == "matched" for row in consensus.json()["submissions"])
+    assert all(row["agreement"]["f1"] == 1.0 for row in consensus.json()["submissions"])
 
     denied = client.get(
         f"/work/tasks/{task['id']}/review-diagnostics?reference=gold", headers=worker_headers[0],

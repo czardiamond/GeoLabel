@@ -14,7 +14,7 @@ from shapely.geometry.base import BaseGeometry
 DEFAULT_LINE_BUFFER = 0.5
 DEFAULT_POINT_DISTANCE_THRESHOLD = 0.5
 DEFAULT_IOU_THRESHOLD = 0.5
-SCORER_VERSION = "geolabel-heuristic-v1"
+SCORER_VERSION = "geolabel-reference-agreement-v2"
 
 
 def scoring_configuration() -> Dict[str, Any]:
@@ -22,8 +22,14 @@ def scoring_configuration() -> Dict[str, Any]:
     return {
         "version": SCORER_VERSION,
         "iou_threshold": DEFAULT_IOU_THRESHOLD,
+        "match_score_threshold": DEFAULT_IOU_THRESHOLD,
         "line_buffer_m": DEFAULT_LINE_BUFFER,
         "point_distance_threshold_m": DEFAULT_POINT_DISTANCE_THRESHOLD,
+        "match_assignment": "greedy_one_to_one_descending_overlap_then_canonical_index",
+        "category_policy": "category_mismatch_counts_as_false_positive_and_false_negative",
+        "primary_metric": "class_aware_micro_f1",
+        "macro_f1_classes": "classes_with_reference_or_submission_support",
+        "zero_denominator": "null",
         "consensus_support": "strict_majority",
         "tie_break": "canonical_geojson_then_index",
     }
@@ -236,6 +242,122 @@ def compare_features_to_reference(
             "overlap_score": round(best[0], 4) if best is not None else None,
         })
     return diagnostics
+
+
+def score_reference_agreement(
+    submitted_features: List[Dict[str, Any]],
+    reference_features: List[Dict[str, Any]],
+    taxonomy: Optional[List[str]] = None,
+    match_score_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:4326",
+) -> Dict[str, Any]:
+    """Return transparent one-to-one, geometry-gated, category-aware metrics.
+
+    Geometry is paired without looking at category, so a spatially correct object
+    with a wrong label remains visible as a class error. Such an error contributes
+    one false positive to the submitted class and one false negative to the
+    reference class. Undefined zero-denominator metrics are reported as null.
+    """
+    submitted_order = sorted(range(len(submitted_features)), key=lambda index: (_stable_json(submitted_features[index]), index))
+    reference_order = sorted(range(len(reference_features)), key=lambda index: (_stable_json(reference_features[index]), index))
+    candidates: List[Tuple[float, int, int]] = []
+    overlaps: Dict[Tuple[int, int], float] = {}
+    for submitted_position, submitted_index in enumerate(submitted_order):
+        submitted = submitted_features[submitted_index]
+        for reference_position, reference_index in enumerate(reference_order):
+            reference = reference_features[reference_index]
+            overlap = compute_iou(
+                submitted.get("geometry", {}), reference.get("geometry", {}), crs=crs
+            )
+            overlaps[(submitted_position, reference_position)] = overlap
+            if overlap >= match_score_threshold:
+                candidates.append((overlap, submitted_position, reference_position))
+
+    matched = _greedy_global_match(candidates)
+    matched_submitted = {left for left, _ in matched}
+    matched_reference = {right for _, right in matched}
+    observed_categories = {
+        str(feature.get("properties", {}).get("category", "default_category"))
+        for feature in submitted_features + reference_features
+    }
+    categories = list(dict.fromkeys(
+        [str(label) for label in (taxonomy or [])] + sorted(observed_categories)
+    ))
+    counts = {
+        label: {"true_positive": 0, "false_positive": 0, "false_negative": 0}
+        for label in categories
+    }
+    confusion: Counter[Tuple[str, str]] = Counter()
+    correct_category_matches = 0
+    matched_overlaps: List[float] = []
+
+    def category(features: List[Dict[str, Any]], original_index: int) -> str:
+        return str(features[original_index].get("properties", {}).get("category", "default_category"))
+
+    for submitted_position, reference_position in matched:
+        submitted_label = category(submitted_features, submitted_order[submitted_position])
+        reference_label = category(reference_features, reference_order[reference_position])
+        matched_overlaps.append(overlaps[(submitted_position, reference_position)])
+        confusion[(reference_label, submitted_label)] += 1
+        if submitted_label == reference_label:
+            counts[reference_label]["true_positive"] += 1
+            correct_category_matches += 1
+        else:
+            counts[submitted_label]["false_positive"] += 1
+            counts[reference_label]["false_negative"] += 1
+
+    for position, original_index in enumerate(submitted_order):
+        if position not in matched_submitted:
+            counts[category(submitted_features, original_index)]["false_positive"] += 1
+    for position, original_index in enumerate(reference_order):
+        if position not in matched_reference:
+            counts[category(reference_features, original_index)]["false_negative"] += 1
+
+    def ratio(numerator: int, denominator: int) -> Optional[float]:
+        return round(numerator / denominator, 4) if denominator else None
+
+    per_class = []
+    for label in categories:
+        row = counts[label]
+        tp, fp, fn = row["true_positive"], row["false_positive"], row["false_negative"]
+        per_class.append({
+            "category": label,
+            **row,
+            "precision": ratio(tp, tp + fp),
+            "recall": ratio(tp, tp + fn),
+            "f1": ratio(2 * tp, 2 * tp + fp + fn),
+            "reference_support": tp + fn,
+            "submission_support": tp + fp,
+        })
+
+    true_positive = sum(row["true_positive"] for row in counts.values())
+    false_positive = sum(row["false_positive"] for row in counts.values())
+    false_negative = sum(row["false_negative"] for row in counts.values())
+    overall_denominator = 2 * true_positive + false_positive + false_negative
+    supported_f1 = [row["f1"] for row in per_class if row["f1"] is not None]
+    return {
+        "reference_feature_count": len(reference_features),
+        "submission_feature_count": len(submitted_features),
+        "geometry_matches": len(matched),
+        "category_mismatches": sum(count for (reference, submitted), count in confusion.items() if reference != submitted),
+        "unmatched_submissions": len(submitted_features) - len(matched_submitted),
+        "unmatched_references": len(reference_features) - len(matched_reference),
+        "mean_matched_overlap": round(sum(matched_overlaps) / len(matched_overlaps), 4) if matched_overlaps else None,
+        "category_accuracy": ratio(correct_category_matches, len(matched)),
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "precision": ratio(true_positive, true_positive + false_positive),
+        "recall": ratio(true_positive, true_positive + false_negative),
+        "f1": ratio(2 * true_positive, overall_denominator),
+        "macro_f1": round(sum(supported_f1) / len(supported_f1), 4) if supported_f1 else None,
+        "per_class": per_class,
+        "confusion_matrix": [
+            {"reference_category": reference, "submission_category": submitted, "count": count}
+            for (reference, submitted), count in sorted(confusion.items())
+        ],
+        "match_score_threshold": match_score_threshold,
+    }
 
 
 def _kappa(observed: float, expected: float) -> float:

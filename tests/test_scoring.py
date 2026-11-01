@@ -5,6 +5,7 @@ from backend.scoring import (
     calculate_cohens_kappa,
     compute_iou,
     compare_features_to_reference,
+    score_reference_agreement,
     scoring_configuration,
 )
 
@@ -76,8 +77,9 @@ def test_geojson_coordinates_are_reprojected_to_task_crs():
 
 def test_scorer_exposes_versioned_explicit_configuration():
     config = scoring_configuration()
-    assert config["version"].startswith("geolabel-heuristic-")
+    assert config["version"].startswith("geolabel-reference-agreement-")
     assert config["iou_threshold"] == 0.5
+    assert config["primary_metric"] == "class_aware_micro_f1"
     assert config["consensus_support"] == "strict_majority"
     assert config["tie_break"]
 
@@ -126,3 +128,55 @@ def test_feature_diagnostics_preserve_original_indexes_after_canonical_sort():
         if item["status"] == "matched"
     )
     assert pairs == [(0, 1), (1, 0)]
+
+
+def test_reference_agreement_counts_wrong_category_as_false_positive_and_negative():
+    score = score_reference_agreement(
+        [polygon(0, "building")],
+        [polygon(0, "road")],
+        taxonomy=["building", "road"],
+        crs="EPSG:4326",
+    )
+    assert score["geometry_matches"] == 1
+    assert score["category_mismatches"] == 1
+    assert score["true_positive"] == 0
+    assert score["false_positive"] == 1
+    assert score["false_negative"] == 1
+    assert score["precision"] == 0.0
+    assert score["recall"] == 0.0
+    assert score["f1"] == 0.0
+    assert score["category_accuracy"] == 0.0
+    assert score["confusion_matrix"] == [{
+        "reference_category": "road", "submission_category": "building", "count": 1,
+    }]
+
+
+def test_reference_agreement_reports_per_class_scores_and_undefined_empty_metrics():
+    score = score_reference_agreement(
+        [polygon(0, "building"), polygon(0.03, "road")],
+        [polygon(0, "building"), polygon(0.06, "road")],
+        taxonomy=["building", "road"],
+        crs="EPSG:4326",
+    )
+    assert score["geometry_matches"] == 1
+    assert score["mean_matched_overlap"] == 1.0
+    assert score["match_score_threshold"] == 0.5
+    assert score["true_positive"] == 1
+    assert score["false_positive"] == 1
+    assert score["false_negative"] == 1
+    assert score["f1"] == 0.5
+    assert {row["category"]: row["f1"] for row in score["per_class"]} == {
+        "building": 1.0, "road": 0.0,
+    }
+
+    empty = score_reference_agreement([], [], taxonomy=["building"], crs="EPSG:4326")
+    assert empty["precision"] is None
+    assert empty["recall"] is None
+    assert empty["f1"] is None
+    assert empty["macro_f1"] is None
+
+    missing_all = score_reference_agreement([], [polygon(0, "building")], crs="EPSG:4326")
+    assert missing_all["precision"] is None
+    assert missing_all["recall"] == 0.0
+    assert missing_all["f1"] == 0.0
+    assert missing_all["false_negative"] == 1

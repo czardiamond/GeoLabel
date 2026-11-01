@@ -83,7 +83,7 @@ from backend.scoring import (
     build_consensus_geojson,
     compare_features_to_reference,
     compute_task_iaa,
-    match_features_cohen,
+    score_reference_agreement,
     scoring_configuration,
 )
 
@@ -721,27 +721,18 @@ def _quality_scores(db: Session, task: Task) -> dict:
     scores = []
     for annotation in annotations:
         features = annotation.geojson.get("features", [])
-        matched, unmatched_gold, unmatched_worker = match_features_cohen(gold_features, features, crs=task.crs)
-        true_positive = len(matched)
-        false_negative = len(unmatched_gold)
-        false_positive = len(unmatched_worker)
-        precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else (1.0 if not gold_features and not features else 0.0)
-        recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else (1.0 if not gold_features and not features else 0.0)
-        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        category_accuracy = sum(
-            1 for reference, candidate in matched
-            if reference.get("properties", {}).get("category") == candidate.get("properties", {}).get("category")
-        ) / true_positive if true_positive else (1.0 if not gold_features and not features else 0.0)
+        metrics = score_reference_agreement(
+            features, gold_features, taxonomy=task.taxonomy, crs=task.crs
+        )
         scores.append({
-            "annotator_id": annotation.annotator_id, "precision": round(precision, 4),
-            "recall": round(recall, 4), "f1": round(f1, 4),
-            "category_accuracy": round(category_accuracy, 4), "matched": true_positive,
-            "false_positive": false_positive, "false_negative": false_negative,
+            "annotator_id": annotation.annotator_id,
+            **metrics,
             "review_status": annotation.review_status,
         })
-    macro = sum(row["f1"] for row in scores) / len(scores) if scores else None
+    defined_f1 = [row["f1"] for row in scores if row["f1"] is not None]
+    macro = sum(defined_f1) / len(defined_f1) if defined_f1 else None
     return {"available": True, "macro_f1": round(macro, 4) if macro is not None else None, "annotators": scores,
-            "method": "geometric matching at the scoring module default IoU threshold; category accuracy measured on matches",
+            "method": "one-to-one geometry matching at the configured match-score threshold; class-aware micro F1; class mismatches count as one false positive and one false negative",
             "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
             "reference_source": "manually supplied task gold standard; not an independently validated dataset"}
 
@@ -1730,11 +1721,15 @@ def get_task_review_diagnostics(
     for row in rows:
         features = row.geojson.get("features", [])
         diagnostics = compare_features_to_reference(features, reference_features, crs=task.crs)
+        agreement = score_reference_agreement(
+            features, reference_features, taxonomy=task.taxonomy, crs=task.crs
+        )
         submissions.append({
             "annotation_id": row.id,
             "annotator_id": row.annotator_id,
             "submitted_at": row.submitted_at.isoformat() if row.submitted_at else None,
             "feature_count": len(features),
+            "agreement": agreement,
             "diagnostics": diagnostics,
         })
     return {
@@ -1742,6 +1737,7 @@ def get_task_review_diagnostics(
         "available": True,
         "reference": reference,
         "reference_source": reference_source,
+        "crs": task.crs,
         "reference_feature_count": len(reference_features),
         "reference_geojson": reference_geojson,
         "annotation_count": len(rows),

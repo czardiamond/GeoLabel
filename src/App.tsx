@@ -12,7 +12,7 @@ const currentCapabilities = [
   { icon: KeyRound, title: 'Organizations, invitations, and roles', text: 'Local accounts use expiring sessions and organization-scoped owner, admin, annotator, reviewer, and analyst roles.' },
   { icon: Layers3, title: 'Submit and reproject GeoJSON', text: 'The API accepts GeoJSON FeatureCollections and transforms submitted geometries into the task CRS.' },
   { icon: Workflow, title: 'Projects, datasets, annotation and review', text: 'Private raster uploads, interactive vector drawing, priority queues, reservations, comments, review/rework, and temporal video segments are supported.' },
-  { icon: Workflow, title: 'Gold-set quality and reviewable suggestions', text: 'Reviewers can maintain reference GeoJSON and calculate heuristic worker scores; provider-supplied pre-annotations can be reviewed.' },
+  { icon: Workflow, title: 'Gold-set quality and reviewable suggestions', text: 'Reviewers can compare submissions with a saved reference or worker consensus using class-aware precision, recall, F1, per-class counts, and visible matching rules; provider-supplied pre-annotations can be reviewed.' },
 ];
 
 const notYetAvailable = [
