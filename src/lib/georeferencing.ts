@@ -6,6 +6,48 @@ export type PixelAssetGeometry = {
   metadata?: { affine_transform?: number[] };
 };
 
+/** Logical overlay coordinate plane shared by raster rendering and pointer input. */
+export const ANNOTATION_CANVAS_WIDTH = 1000;
+export const ANNOTATION_CANVAS_HEIGHT = 700;
+export type ClientViewportRect = { left: number; top: number; width: number; height: number };
+
+/** Map a browser pointer into the full logical annotation plane, independent of viewport aspect ratio. */
+export function clientToAnnotationCanvas(
+  clientX: number,
+  clientY: number,
+  rect: ClientViewportRect,
+): [number, number] {
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)
+      || !Number.isFinite(rect.left) || !Number.isFinite(rect.top)
+      || !Number.isFinite(rect.width) || !Number.isFinite(rect.height)
+      || rect.width <= 0 || rect.height <= 0) return [0, 0];
+  const x = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  const y = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+  return [x * ANNOTATION_CANVAS_WIDTH, y * ANNOTATION_CANVAS_HEIGHT];
+}
+
+/** Convert logical overlay coordinates to source-image pixel-corner coordinates. */
+export function annotationCanvasToSourcePixel(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): [number, number] {
+  if (width <= 0 || height <= 0) return [x, y];
+  return [x / ANNOTATION_CANVAS_WIDTH * width, y / ANNOTATION_CANVAS_HEIGHT * height];
+}
+
+/** Convert source-image pixel-corner coordinates to the logical overlay plane. */
+export function sourcePixelToAnnotationCanvas(
+  pixelX: number,
+  pixelY: number,
+  width: number,
+  height: number,
+): [number, number] {
+  if (width <= 0 || height <= 0) return [pixelX, pixelY];
+  return [pixelX / width * ANNOTATION_CANVAS_WIDTH, pixelY / height * ANNOTATION_CANVAS_HEIGHT];
+}
+
 /** Return the exact source-pixel-corner affine, or a north-up affine from bounds. */
 export function assetPixelAffine(asset?: PixelAssetGeometry): AffineTransform | null {
   const width = asset?.width ?? 0;
@@ -50,11 +92,12 @@ export function screenToGeo(x: number, y: number, asset?: PixelAssetGeometry): [
   if (!assetPixelAffine(asset)) {
     const bounds = asset?.bounds;
     if (bounds && bounds.length === 4 && bounds[0] < bounds[2] && bounds[1] < bounds[3]) {
-      return [bounds[0] + x / 1000 * (bounds[2] - bounds[0]), bounds[3] - y / 700 * (bounds[3] - bounds[1])];
+      return [bounds[0] + x / ANNOTATION_CANVAS_WIDTH * (bounds[2] - bounds[0]), bounds[3] - y / ANNOTATION_CANVAS_HEIGHT * (bounds[3] - bounds[1])];
     }
     return [x, y];
   }
-  return sourcePixelToGeo(x / 1000 * width, y / 700 * height, asset);
+  const [pixelX, pixelY] = annotationCanvasToSourcePixel(x, y, width, height);
+  return sourcePixelToGeo(pixelX, pixelY, asset);
 }
 
 export function geoToScreen(point: [number, number], asset?: PixelAssetGeometry): [number, number] {
@@ -64,10 +107,10 @@ export function geoToScreen(point: [number, number], asset?: PixelAssetGeometry)
   if (!assetPixelAffine(asset)) {
     const bounds = asset?.bounds;
     if (bounds && bounds.length === 4 && bounds[0] < bounds[2] && bounds[1] < bounds[3]) {
-      return [(point[0] - bounds[0]) / (bounds[2] - bounds[0]) * 1000, (bounds[3] - point[1]) / (bounds[3] - bounds[1]) * 700];
+      return [(point[0] - bounds[0]) / (bounds[2] - bounds[0]) * ANNOTATION_CANVAS_WIDTH, (bounds[3] - point[1]) / (bounds[3] - bounds[1]) * ANNOTATION_CANVAS_HEIGHT];
     }
     return point;
   }
   const [pixelX, pixelY] = geoToSourcePixel(point, asset);
-  return [pixelX / width * 1000, pixelY / height * 700];
+  return sourcePixelToAnnotationCanvas(pixelX, pixelY, width, height);
 }

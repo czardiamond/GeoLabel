@@ -147,11 +147,20 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     worker_preview = client.get(f"/work/tasks/{task['id']}/asset/preview", headers=worker_headers)
     assert worker_preview.status_code == 200
 
+    empty_gold = client.get(f"/work/tasks/{task['id']}/gold-standard", headers=owner_headers)
+    assert empty_gold.status_code == 200
+    assert empty_gold.json()["available"] is False
+    assert empty_gold.json()["geojson"]["features"] == []
     gold = client.put(
         f"/work/tasks/{task['id']}/gold-standard", headers=owner_headers,
         json={"geojson": polygon_collection()},
     )
     assert gold.status_code == 200, gold.text
+    saved_gold = client.get(f"/work/tasks/{task['id']}/gold-standard", headers=owner_headers)
+    assert saved_gold.status_code == 200, saved_gold.text
+    assert saved_gold.json()["available"] is True
+    assert saved_gold.json()["geojson"] == polygon_collection()
+    assert client.get(f"/work/tasks/{task['id']}/gold-standard", headers=worker_headers).status_code == 403
 
     suggestion = client.post(
         f"/work/tasks/{task['id']}/preannotations", headers=owner_headers,
@@ -206,6 +215,17 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     review_queue = client.get(f"/organizations/{org_id}/queue?view=review", headers=owner_headers)
     assert review_queue.status_code == 200
     assert review_queue.json()[0]["id"] == task["id"]
+    missing_rework_reason = client.post(
+        f"/work/tasks/{task['id']}/review", headers=owner_headers,
+        json={"decision": "rework", "comment": "  "},
+    )
+    assert missing_rework_reason.status_code == 422
+    missing_reject_reason = client.post(
+        f"/work/tasks/{task['id']}/review", headers=owner_headers,
+        json={"decision": "reject", "comment": "  "},
+    )
+    assert missing_reject_reason.status_code == 422
+    assert client.get(f"/work/tasks/{task['id']}", headers=owner_headers).json()["review_status"] == "pending_review"
     rework = client.post(
         f"/work/tasks/{task['id']}/review", headers=owner_headers,
         json={"decision": "rework", "comment": "Please refine the western boundary."},

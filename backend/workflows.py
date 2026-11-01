@@ -250,6 +250,13 @@ class ReviewDecision(BaseModel):
     decision: str = Field(pattern="^(accept|reject|rework)$")
     comment: str = Field(default="", max_length=4000)
 
+    @field_validator("comment")
+    @classmethod
+    def require_corrective_feedback(cls, value, info):
+        if info.data.get("decision") in {"reject", "rework"} and not value.strip():
+            raise ValueError("A reason is required when rejecting an annotation or requesting rework.")
+        return value
+
 
 class CommentCreate(BaseModel):
     body: str = Field(min_length=1, max_length=10000)
@@ -1608,6 +1615,19 @@ def update_issue_status(comment_id: str, payload: IssueStatusUpdate, member: Mem
         notify(db, comment.author_user_id, "Issue status updated", f"The issue on {task.title or task.id} is now {payload.status}.", "task", task.id)
     db.commit()
     return {"id": comment.id, "status": comment.status, "resolved_by_user_id": comment.resolved_by_user_id, "resolved_at": comment.resolved_at}
+
+
+@router.get("/work/tasks/{task_id}/gold-standard")
+def get_gold_standard(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    task, membership = _task_for_member(db, task_id, member)
+    require_roles(membership, "owner", "admin", "reviewer")
+    if task.task_type == "video":
+        raise HTTPException(status_code=415, detail="Gold-standard time segments are not supported for video tasks in this release.")
+    item = db.query(GoldStandard).filter_by(task_id=task.id).first()
+    empty = {"type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": task.crs}}, "features": []}
+    if not item:
+        return {"task_id": task.id, "available": False, "geojson": empty, "updated_at": None}
+    return {"task_id": task.id, "available": True, "geojson": json.loads(item.geojson_data), "updated_at": item.updated_at}
 
 
 @router.put("/work/tasks/{task_id}/gold-standard")

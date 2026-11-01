@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { annotationCanvasToSourcePixel, clientToAnnotationCanvas } from './georeferencing.ts';
 import { componentMask, eraseStroke, fillEnclosed, mergeMasks, paintStroke, splitMaskComponents } from './pixelMasks.ts';
 
 test('paint and eraser strokes affect source pixel centers and preserve other pixels', () => {
@@ -12,6 +13,21 @@ test('paint and eraser strokes affect source pixel centers and preserve other pi
   assert.equal(erased[11], 0);
   const untouched = paintStroke(empty, 5, 5, [[0.5, 0.5]], 0.6);
   assert.equal(untouched[0], 255);
+});
+
+test('wide and tall viewport brush points target the expected source pixels', () => {
+  const cases = [
+    { width: 400, height: 200, rect: { left: 10, top: 20, width: 1200, height: 600 }, client: [310, 320] as [number, number], pixel: [100, 100] as [number, number] },
+    { width: 200, height: 400, rect: { left: 50, top: 30, width: 400, height: 800 }, client: [150, 430] as [number, number], pixel: [50, 200] as [number, number] },
+  ];
+
+  for (const { width, height, rect, client, pixel } of cases) {
+    const canvasPoint = clientToAnnotationCanvas(client[0], client[1], rect);
+    const sourcePixel = annotationCanvasToSourcePixel(canvasPoint[0], canvasPoint[1], width, height);
+    assert.deepEqual(sourcePixel, pixel);
+    const mask = paintStroke(new Uint8Array(width * height), width, height, [sourcePixel], 1);
+    assert.equal(mask[pixel[1] * width + pixel[0]], 255);
+  }
 });
 
 test('fill adds only an enclosed transparent component', () => {
