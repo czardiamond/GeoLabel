@@ -1,6 +1,6 @@
 from backend.geo_utils import reproject_feature_collection
 from backend.scoring import (
-    _greedy_global_match,
+    _optimal_global_match,
     build_consensus_geojson,
     calculate_cohens_kappa,
     compute_iou,
@@ -78,7 +78,9 @@ def test_geojson_coordinates_are_reprojected_to_task_crs():
 def test_scorer_exposes_versioned_explicit_configuration():
     config = scoring_configuration()
     assert config["version"].startswith("geolabel-reference-agreement-")
+    assert config["version"] == "geolabel-reference-agreement-v3"
     assert config["iou_threshold"] == 0.5
+    assert config["match_assignment"] == "maximum_cardinality_then_maximum_total_overlap_one_to_one"
     assert config["primary_metric"] == "class_aware_micro_f1"
     assert config["consensus_support"] == "strict_majority"
     assert config["tie_break"]
@@ -97,9 +99,67 @@ def test_consensus_tie_is_stable_and_does_not_fabricate_a_majority():
     assert first["features"] == []
 
 
-def test_equal_score_matching_uses_stable_index_tie_break():
-    candidates = [(0.8, 1, 1), (0.8, 0, 1), (0.8, 0, 0)]
-    assert _greedy_global_match(candidates) == [(0, 0), (1, 1)]
+def test_global_matching_prefers_two_valid_pairs_over_one_higher_overlap_pair():
+    candidates = [(0.9, 0, 0), (0.8, 0, 1), (0.85, 1, 0)]
+    assert _optimal_global_match(candidates) == [(0, 1), (1, 0)]
+
+
+def test_global_matching_maximizes_total_overlap_after_match_count():
+    candidates = [
+        (0.8, 0, 0), (0.9, 0, 1),
+        (0.7, 1, 0), (0.6, 1, 1),
+    ]
+    assert _optimal_global_match(candidates) == [(0, 1), (1, 0)]
+
+
+def test_global_matching_handles_empty_and_rectangular_candidate_sets():
+    assert _optimal_global_match([]) == []
+    assert _optimal_global_match([(0.7, 5, 9), (0.8, 5, 9)]) == [(5, 9)]
+    assert _optimal_global_match([(0.6, 0, 9), (0.9, 1, 9)]) == [(1, 9)]
+
+
+def test_equal_score_matching_is_deterministic_and_input_order_independent():
+    candidates = [(0.8, 1, 1), (0.8, 0, 1), (0.8, 1, 0), (0.8, 0, 0)]
+    expected = _optimal_global_match(candidates)
+    assert _optimal_global_match(list(reversed(candidates))) == expected
+    assert _optimal_global_match(candidates) == expected
+
+
+def test_reference_metrics_and_diagnostics_use_global_assignment(monkeypatch):
+    submitted = [
+        {"type": "Feature", "properties": {"category": "x"},
+         "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        {"type": "Feature", "properties": {"category": "y"},
+         "geometry": {"type": "Point", "coordinates": [1, 0]}},
+    ]
+    reference = [
+        {"type": "Feature", "properties": {"category": "y"},
+         "geometry": {"type": "Point", "coordinates": [10, 0]}},
+        {"type": "Feature", "properties": {"category": "x"},
+         "geometry": {"type": "Point", "coordinates": [11, 0]}},
+    ]
+    overlaps = {
+        (0, 10): 0.9, (0, 11): 0.8,
+        (1, 10): 0.85, (1, 11): 0.1,
+    }
+
+    def fake_iou(geometry_a, geometry_b, **kwargs):
+        return overlaps[(geometry_a["coordinates"][0], geometry_b["coordinates"][0])]
+
+    monkeypatch.setattr("backend.scoring.compute_iou", fake_iou)
+    score = score_reference_agreement(
+        submitted, reference, taxonomy=["x", "y"], crs="EPSG:4326"
+    )
+    assert score["geometry_matches"] == 2
+    assert score["true_positive"] == 2
+    assert score["category_mismatches"] == 0
+    assert score["f1"] == 1.0
+    diagnostics = compare_features_to_reference(submitted, reference, crs="EPSG:4326")
+    pairs = sorted(
+        (item["feature_index"], item["reference_feature_index"])
+        for item in diagnostics if item["status"] == "matched"
+    )
+    assert pairs == [(0, 1), (1, 0)]
 
 
 def test_feature_diagnostics_report_category_and_presence_disagreements():

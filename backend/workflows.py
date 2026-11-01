@@ -732,7 +732,7 @@ def _quality_scores(db: Session, task: Task) -> dict:
     defined_f1 = [row["f1"] for row in scores if row["f1"] is not None]
     macro = sum(defined_f1) / len(defined_f1) if defined_f1 else None
     return {"available": True, "macro_f1": round(macro, 4) if macro is not None else None, "annotators": scores,
-            "method": "one-to-one geometry matching at the configured match-score threshold; class-aware micro F1; class mismatches count as one false positive and one false negative",
+            "method": "maximum-cardinality, maximum-total-overlap one-to-one geometry matching at the configured threshold; class-aware micro F1; class mismatches count as one false positive and one false negative",
             "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
             "reference_source": "manually supplied task gold standard; not an independently validated dataset"}
 

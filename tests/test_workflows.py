@@ -365,7 +365,7 @@ def test_review_diagnostics_are_feature_level_bounded_and_reviewer_only(api_clie
     assert gold.json()["available"] is True
     assert gold.json()["reference_source"] == "independent_gold_reference"
     assert gold.json()["scorer_configuration"]["iou_threshold"] == 0.5
-    assert gold.json()["scorer_version"] == "geolabel-reference-agreement-v2"
+    assert gold.json()["scorer_version"] == "geolabel-reference-agreement-v3"
     assert gold.json()["crs"] == "EPSG:4326"
     assert all(row["diagnostics"][0]["status"] == "category_mismatch" for row in gold.json()["submissions"])
     assert all(row["agreement"]["geometry_matches"] == 1 for row in gold.json()["submissions"])

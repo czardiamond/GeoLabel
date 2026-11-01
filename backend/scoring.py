@@ -14,7 +14,7 @@ from shapely.geometry.base import BaseGeometry
 DEFAULT_LINE_BUFFER = 0.5
 DEFAULT_POINT_DISTANCE_THRESHOLD = 0.5
 DEFAULT_IOU_THRESHOLD = 0.5
-SCORER_VERSION = "geolabel-reference-agreement-v2"
+SCORER_VERSION = "geolabel-reference-agreement-v3"
 
 
 def scoring_configuration() -> Dict[str, Any]:
@@ -25,13 +25,13 @@ def scoring_configuration() -> Dict[str, Any]:
         "match_score_threshold": DEFAULT_IOU_THRESHOLD,
         "line_buffer_m": DEFAULT_LINE_BUFFER,
         "point_distance_threshold_m": DEFAULT_POINT_DISTANCE_THRESHOLD,
-        "match_assignment": "greedy_one_to_one_descending_overlap_then_canonical_index",
+        "match_assignment": "maximum_cardinality_then_maximum_total_overlap_one_to_one",
         "category_policy": "category_mismatch_counts_as_false_positive_and_false_negative",
         "primary_metric": "class_aware_micro_f1",
         "macro_f1_classes": "classes_with_reference_or_submission_support",
         "zero_denominator": "null",
         "consensus_support": "strict_majority",
-        "tie_break": "canonical_geojson_then_index",
+        "tie_break": "canonical_feature_order_then_deterministic_assignment_order",
     }
 
 
@@ -121,16 +121,102 @@ def compute_iou(
         return 0.0
 
 
-def _greedy_global_match(candidates: List[Tuple[float, Any, Any]]) -> List[Tuple[Any, Any]]:
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    used_left, used_right, matches = set(), set(), []
+def _optimal_global_match(candidates: List[Tuple[float, int, int]]) -> List[Tuple[int, int]]:
+    """Assign eligible pairs by maximum cardinality, then maximum total overlap.
+
+    A rectangular Hungarian assignment is run with one unmatched dummy column
+    per row. Rows come from the smaller side to keep the cubic component bounded
+    for highly rectangular pair matrices. Callers supply only pairs whose
+    geometry score meets the configured threshold.
+    """
+    if not candidates:
+        return []
+
+    score_by_pair: Dict[Tuple[int, int], float] = {}
     for score, left, right in candidates:
-        if left in used_left or right in used_right:
+        if not math.isfinite(score):
             continue
-        used_left.add(left)
-        used_right.add(right)
-        matches.append((left, right))
-    return matches
+        score = min(1.0, max(0.0, float(score)))
+        pair = (left, right)
+        score_by_pair[pair] = max(score_by_pair.get(pair, -math.inf), score)
+    if not score_by_pair:
+        return []
+
+    left_ids = sorted({left for left, _ in score_by_pair})
+    right_ids = sorted({right for _, right in score_by_pair})
+    rows_are_left = len(left_ids) <= len(right_ids)
+    row_ids = left_ids if rows_are_left else right_ids
+    column_ids = right_ids if rows_are_left else left_ids
+    score_scale = min(len(left_ids), len(right_ids)) + 1.0
+
+    # Valid edges have negative costs; unmatched dummy edges cost zero and
+    # invalid real edges cost positive one. A unit cardinality bonus dominates
+    # every possible difference in normalized overlap sum (< 1).
+    costs: List[List[float]] = []
+    for row_id in row_ids:
+        row_costs = []
+        for column_id in column_ids:
+            pair = (row_id, column_id) if rows_are_left else (column_id, row_id)
+            score = score_by_pair.get(pair)
+            row_costs.append(-(1.0 + score / score_scale) if score is not None else 1.0)
+        row_costs.extend([0.0] * len(row_ids))
+        costs.append(row_costs)
+
+    # Hungarian algorithm for n rows and m >= n columns (minimum cost).
+    n, m = len(costs), len(costs[0])
+    row_potential = [0.0] * (n + 1)
+    column_potential = [0.0] * (m + 1)
+    assigned_row = [0] * (m + 1)
+    previous_column = [0] * (m + 1)
+    for row in range(1, n + 1):
+        assigned_row[0] = row
+        current_column = 0
+        best_reduced_cost = [math.inf] * (m + 1)
+        visited = [False] * (m + 1)
+        while True:
+            visited[current_column] = True
+            current_row = assigned_row[current_column]
+            delta = math.inf
+            next_column = 0
+            for column in range(1, m + 1):
+                if visited[column]:
+                    continue
+                reduced_cost = (
+                    costs[current_row - 1][column - 1]
+                    - row_potential[current_row]
+                    - column_potential[column]
+                )
+                if reduced_cost < best_reduced_cost[column]:
+                    best_reduced_cost[column] = reduced_cost
+                    previous_column[column] = current_column
+                if best_reduced_cost[column] < delta:
+                    delta = best_reduced_cost[column]
+                    next_column = column
+            for column in range(m + 1):
+                if visited[column]:
+                    row_potential[assigned_row[column]] += delta
+                    column_potential[column] -= delta
+                else:
+                    best_reduced_cost[column] -= delta
+            current_column = next_column
+            if assigned_row[current_column] == 0:
+                break
+        while True:
+            next_column = previous_column[current_column]
+            assigned_row[current_column] = assigned_row[next_column]
+            current_column = next_column
+            if current_column == 0:
+                break
+
+    matches = []
+    for column in range(1, m + 1):
+        row = assigned_row[column]
+        if not row or column > len(column_ids):
+            continue
+        pair = (row_ids[row - 1], column_ids[column - 1]) if rows_are_left else (column_ids[column - 1], row_ids[row - 1])
+        if pair in score_by_pair:
+            matches.append(pair)
+    return sorted(matches)
 
 
 def match_features_cohen(
@@ -139,7 +225,7 @@ def match_features_cohen(
     iou_threshold: float = DEFAULT_IOU_THRESHOLD,
     crs: str = "EPSG:3857",
 ) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    # Canonical feature order makes equal-overlap greedy matches independent of
+    # Canonical feature order makes assignment tie outcomes independent of
     # client feature-array ordering while preserving the original feature data.
     features_a = sorted(features_a, key=_stable_json)
     features_b = sorted(features_b, key=_stable_json)
@@ -150,7 +236,7 @@ def match_features_cohen(
             if score >= iou_threshold:
                 candidates.append((score, idx_a, idx_b))
 
-    pairs = _greedy_global_match(candidates)
+    pairs = _optimal_global_match(candidates)
     matched_a = {idx_a for idx_a, _ in pairs}
     matched_b = {idx_b for _, idx_b in pairs}
     return (
@@ -194,7 +280,7 @@ def compare_features_to_reference(
             if overlap >= iou_threshold:
                 candidates.append((overlap, submitted_position, reference_position))
 
-    matched = _greedy_global_match(candidates)
+    matched = _optimal_global_match(candidates)
     matched_submitted: set[int] = set()
     matched_reference: set[int] = set()
     diagnostics: List[Dict[str, Any]] = []
@@ -273,7 +359,7 @@ def score_reference_agreement(
             if overlap >= match_score_threshold:
                 candidates.append((overlap, submitted_position, reference_position))
 
-    matched = _greedy_global_match(candidates)
+    matched = _optimal_global_match(candidates)
     matched_submitted = {left for left, _ in matched}
     matched_reference = {right for _, right in matched}
     observed_categories = {
@@ -441,7 +527,7 @@ def cluster_features_fleiss(
                 )
                 if overlap >= iou_threshold:
                     candidates.append((overlap, cluster_idx, feature_idx))
-        matches = _greedy_global_match(candidates)
+        matches = _optimal_global_match(candidates)
         matched_features = set()
         for cluster_idx, feature_idx in matches:
             clusters[cluster_idx][rater_idx] = features[feature_idx]
