@@ -41,6 +41,26 @@ export function reviewDiagnosticKey(diagnostic: ReviewFeatureDiagnostic): string
   ].join(':');
 }
 
+/** Find a diagnostic's position in a list using its stable review key. */
+export function reviewDiagnosticIndex(
+  diagnostics: readonly ReviewFeatureDiagnostic[],
+  selectedKey: string,
+): number {
+  return diagnostics.findIndex((diagnostic) => reviewDiagnosticKey(diagnostic) === selectedKey);
+}
+
+/** Return the adjacent finding; with no current selection, start at the requested end. */
+export function adjacentReviewDiagnostic(
+  diagnostics: readonly ReviewFeatureDiagnostic[],
+  selectedKey: string,
+  direction: -1 | 1,
+): ReviewFeatureDiagnostic | null {
+  if (!diagnostics.length) return null;
+  const currentIndex = selectedKey ? reviewDiagnosticIndex(diagnostics, selectedKey) : -1;
+  if (currentIndex < 0) return direction === 1 ? diagnostics[0] : diagnostics[diagnostics.length - 1];
+  return diagnostics[currentIndex + direction] ?? null;
+}
+
 export function countReviewDiagnosticStatuses(diagnostics: readonly ReviewFeatureDiagnostic[]): Record<ReviewFeatureDiagnostic['status'], number> {
   const counts: Record<ReviewFeatureDiagnostic['status'], number> = {
     matched: 0,
