@@ -4,8 +4,18 @@ export type ReviewOverlayAnnotation<T> = {
   geojson?: { features?: T[] };
 };
 
-export type ReviewOverlayConsensus<T> = {
+export type ReviewDiagnosticReference = 'consensus' | 'gold';
+
+export type ReviewDiagnosticsPayload<T> = {
   available?: boolean;
+  reference?: string;
+  reference_geojson?: { features?: T[] };
+};
+
+export type ReviewOverlayReference<T> = {
+  available: true;
+  label: string;
+  color: string;
   geojson?: { features?: T[] };
 };
 
@@ -18,18 +28,29 @@ export type ReviewOverlayLayer<T> = {
 
 const WORKER_COLORS = ['#f97316', '#2563eb', '#a855f7', '#e11d48', '#0891b2'];
 
+/** Only expose a reference overlay when it matches the currently selected diagnostics. */
+export function selectReviewOverlayReference<T>(
+  diagnostics: ReviewDiagnosticsPayload<T> | null | undefined,
+  selectedReference: ReviewDiagnosticReference,
+): ReviewOverlayReference<T> | null {
+  if (!diagnostics?.available || diagnostics.reference !== selectedReference) return null;
+  return selectedReference === 'gold'
+    ? { available: true, label: 'Gold reference', color: '#0891b2', geojson: diagnostics.reference_geojson }
+    : { available: true, label: 'Worker consensus', color: '#16a34a', geojson: diagnostics.reference_geojson };
+}
+
 /** Build read-only comparison layers without touching the editable annotation draft. */
 export function buildReviewOverlayLayers<T>(
   annotations: readonly ReviewOverlayAnnotation<T>[],
-  consensus?: ReviewOverlayConsensus<T> | null,
+  reference?: ReviewOverlayReference<T> | null,
 ): ReviewOverlayLayer<T>[] {
   const layers: ReviewOverlayLayer<T>[] = [];
-  if (consensus?.available) {
+  if (reference?.available) {
     layers.push({
-      id: 'consensus',
-      label: 'Consensus',
-      color: '#16a34a',
-      features: consensus.geojson?.features || [],
+      id: 'reference',
+      label: reference.label,
+      color: reference.color,
+      features: reference.geojson?.features || [],
     });
   }
   annotations.forEach((annotation, index) => {
