@@ -159,6 +159,85 @@ def _category(feature: Dict[str, Any], allowed: List[str]) -> str:
     return value if value in allowed else "default_category"
 
 
+def compare_features_to_reference(
+    submitted_features: List[Dict[str, Any]],
+    reference_features: List[Dict[str, Any]],
+    iou_threshold: float = DEFAULT_IOU_THRESHOLD,
+    crs: str = "EPSG:4326",
+) -> List[Dict[str, Any]]:
+    """Describe heuristic feature matches while retaining original array indexes."""
+    submitted_order = sorted(range(len(submitted_features)), key=lambda index: (_stable_json(submitted_features[index]), index))
+    reference_order = sorted(range(len(reference_features)), key=lambda index: (_stable_json(reference_features[index]), index))
+    candidates: List[Tuple[float, int, int]] = []
+    best_for_submitted: Dict[int, Tuple[float, int]] = {}
+    best_for_reference: Dict[int, Tuple[float, int]] = {}
+    overlap_by_positions: Dict[Tuple[int, int], float] = {}
+
+    for submitted_position, submitted_index in enumerate(submitted_order):
+        submitted = submitted_features[submitted_index]
+        for reference_position, reference_index in enumerate(reference_order):
+            reference = reference_features[reference_index]
+            overlap = compute_iou(submitted.get("geometry", {}), reference.get("geometry", {}), crs=crs)
+            overlap_by_positions[(submitted_position, reference_position)] = overlap
+            previous = best_for_submitted.get(submitted_index)
+            if previous is None or overlap > previous[0]:
+                best_for_submitted[submitted_index] = (overlap, reference_index)
+            previous = best_for_reference.get(reference_index)
+            if previous is None or overlap > previous[0]:
+                best_for_reference[reference_index] = (overlap, submitted_index)
+            if overlap >= iou_threshold:
+                candidates.append((overlap, submitted_position, reference_position))
+
+    matched = _greedy_global_match(candidates)
+    matched_submitted: set[int] = set()
+    matched_reference: set[int] = set()
+    diagnostics: List[Dict[str, Any]] = []
+    for submitted_position, reference_position in matched:
+        submitted_index = submitted_order[submitted_position]
+        reference_index = reference_order[reference_position]
+        submitted = submitted_features[submitted_index]
+        reference = reference_features[reference_index]
+        submitted_category = str(submitted.get("properties", {}).get("category", "default_category"))
+        reference_category = str(reference.get("properties", {}).get("category", "default_category"))
+        matched_submitted.add(submitted_index)
+        matched_reference.add(reference_index)
+        diagnostics.append({
+            "status": "matched" if submitted_category == reference_category else "category_mismatch",
+            "feature_index": submitted_index,
+            "reference_feature_index": reference_index,
+            "submitted_category": submitted_category,
+            "reference_category": reference_category,
+            "overlap_score": round(overlap_by_positions[(submitted_position, reference_position)], 4),
+        })
+
+    for submitted_index, feature in enumerate(submitted_features):
+        if submitted_index in matched_submitted:
+            continue
+        best = best_for_submitted.get(submitted_index)
+        diagnostics.append({
+            "status": "unmatched_submission",
+            "feature_index": submitted_index,
+            "reference_feature_index": None,
+            "submitted_category": str(feature.get("properties", {}).get("category", "default_category")),
+            "reference_category": None,
+            "overlap_score": round(best[0], 4) if best is not None else None,
+        })
+
+    for reference_index, feature in enumerate(reference_features):
+        if reference_index in matched_reference:
+            continue
+        best = best_for_reference.get(reference_index)
+        diagnostics.append({
+            "status": "unmatched_reference",
+            "feature_index": None,
+            "reference_feature_index": reference_index,
+            "submitted_category": None,
+            "reference_category": str(feature.get("properties", {}).get("category", "default_category")),
+            "overlap_score": round(best[0], 4) if best is not None else None,
+        })
+    return diagnostics
+
+
 def _kappa(observed: float, expected: float) -> float:
     if math.isclose(1.0, expected):
         value = 1.0 if math.isclose(observed, 1.0) else 0.0

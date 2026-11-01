@@ -81,6 +81,7 @@ from backend.models import (
 from backend.scoring import (
     SCORER_VERSION,
     build_consensus_geojson,
+    compare_features_to_reference,
     compute_task_iaa,
     match_features_cohen,
     scoring_configuration,
@@ -1676,6 +1677,83 @@ def get_task_consensus(task_id: str, member: MemberContext = Depends(require_mem
             "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus,
             "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
             "reference_source": "independent worker submissions; agreement is not an accuracy guarantee"}
+
+
+@router.get("/work/tasks/{task_id}/review-diagnostics")
+def get_task_review_diagnostics(
+    task_id: str,
+    reference: str = Query(default="consensus", pattern="^(consensus|gold)$"),
+    member: MemberContext = Depends(require_member),
+    db: Session = Depends(get_db),
+):
+    task, membership = _task_for_member(db, task_id, member)
+    require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    empty = {"type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": task.crs}}, "features": []}
+    if task.task_type == "video":
+        return {"task_id": task.id, "available": False, "reference": reference,
+                "reason": "video_geometry_not_supported", "reference_geojson": empty,
+                "annotation_count": 0, "iaa_score": None, "iaa_type": "insufficient_annotations"}
+
+    rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
+    if not rows:
+        return {"task_id": task.id, "available": False, "reference": reference,
+                "reason": "no_submissions", "reference_geojson": empty,
+                "annotation_count": 0, "iaa_score": None, "iaa_type": "insufficient_annotations"}
+
+    iaa_score, iaa_type = None, "insufficient_annotations"
+    if reference == "gold":
+        gold = db.query(GoldStandard).filter_by(task_id=task.id).first()
+        if not gold:
+            return {"task_id": task.id, "available": False, "reference": reference,
+                    "reason": "gold_reference_unavailable", "reference_geojson": empty,
+                    "annotation_count": len(rows), "iaa_score": None, "iaa_type": iaa_type}
+        reference_geojson = json.loads(gold.geojson_data)
+        reference_source = "independent_gold_reference"
+        interpretation = "A gold reference is organization-supplied and is not independently validated."
+    else:
+        if len(rows) < 2:
+            return {"task_id": task.id, "available": False, "reference": reference,
+                    "reason": "insufficient_independent_annotations", "reference_geojson": empty,
+                    "annotation_count": len(rows), "iaa_score": None, "iaa_type": iaa_type}
+        annotation_rows = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
+        iaa_score, iaa_type = compute_task_iaa(annotation_rows, task.taxonomy, crs=task.crs)
+        reference_geojson = build_consensus_geojson(annotation_rows, iaa_score=iaa_score, crs=task.crs)
+        reference_source = "heuristic_consensus"
+        interpretation = "Consensus is derived from worker agreement; it is not ground truth or an accuracy guarantee."
+
+    reference_features = reference_geojson.get("features", [])
+    feature_pair_count = sum(len(row.geojson.get("features", [])) * len(reference_features) for row in rows)
+    if feature_pair_count > 20_000:
+        raise HTTPException(status_code=413, detail="Review diagnostics are limited to 20,000 feature comparisons per request. Split this task into smaller review units.")
+
+    submissions = []
+    for row in rows:
+        features = row.geojson.get("features", [])
+        diagnostics = compare_features_to_reference(features, reference_features, crs=task.crs)
+        submissions.append({
+            "annotation_id": row.id,
+            "annotator_id": row.annotator_id,
+            "submitted_at": row.submitted_at.isoformat() if row.submitted_at else None,
+            "feature_count": len(features),
+            "diagnostics": diagnostics,
+        })
+    return {
+        "task_id": task.id,
+        "available": True,
+        "reference": reference,
+        "reference_source": reference_source,
+        "reference_feature_count": len(reference_features),
+        "reference_geojson": reference_geojson,
+        "annotation_count": len(rows),
+        "required_support": len(rows) // 2 + 1 if reference == "consensus" else None,
+        "iaa_score": iaa_score,
+        "iaa_type": iaa_type,
+        "feature_pair_count": feature_pair_count,
+        "submissions": submissions,
+        "scorer_version": SCORER_VERSION,
+        "scorer_configuration": scoring_configuration(),
+        "interpretation": interpretation,
+    }
 
 
 @router.post("/work/tasks/{task_id}/preannotations", status_code=status.HTTP_201_CREATED)

@@ -31,6 +31,12 @@ test('wide and tall image viewports map pointer positions to the same annotation
   assert.deepEqual(geoToScreen([400, 230], asset), widePoint);
 });
 
+test('zoomed and scroll-panned imagery maps the pointer to its original source location', () => {
+  const fitPoint = clientToAnnotationCanvas(250, 175, { left: 0, top: 0, width: 1000, height: 700 });
+  const zoomedPannedPoint = clientToAnnotationCanvas(0, 0, { left: -500, top: -350, width: 2000, height: 1400 });
+  assert.deepEqual(zoomedPannedPoint, fitPoint);
+});
+
 test('pointer mapping clamps to the viewport and safely handles a collapsed surface', () => {
   assert.deepEqual(clientToAnnotationCanvas(-10, 900, { left: 0, top: 0, width: 400, height: 800 }), [0, 700]);
   assert.deepEqual(clientToAnnotationCanvas(10, 20, { left: 10, top: 20, width: 0, height: 100 }), [0, 0]);

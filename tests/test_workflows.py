@@ -281,3 +281,101 @@ def test_org_roles_isolate_projects_and_reject_unsafe_remote_import(api_client):
     assert client.get("/auth/me", headers=first_headers).status_code == 200
     assert client.post("/auth/logout", headers=first_headers).status_code == 204
     assert client.get("/auth/me", headers=first_headers).status_code == 401
+
+
+def test_review_diagnostics_are_feature_level_bounded_and_reviewer_only(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "diagnostic-assets"))
+    organization, _, owner_headers = create_org_and_owner(client, "Diagnostic Review", "diagnostic-owner@example.com")
+    org_id = organization["id"]
+    worker_headers = []
+    worker_ids = []
+    for index in range(2):
+        invitation = client.post(
+            f"/organizations/{org_id}/invitations", headers=owner_headers,
+            json={"email": f"diagnostic-worker-{index}@example.com", "role": "annotator"},
+        )
+        accepted = client.post("/auth/invitations/accept", json={
+            "token": invitation.json()["token"], "display_name": f"Diagnostic Worker {index}",
+            "password": f"diagnostic-worker-password-{index}",
+        })
+        worker_headers.append({"Authorization": f"Bearer {accepted.json()['access_token']}"})
+        worker_ids.append(accepted.json()["user"]["id"])
+
+    project = client.post(
+        f"/organizations/{org_id}/projects", headers=owner_headers,
+        json={"name": "Object-level review", "description": "Diagnostics integration test"},
+    ).json()
+    dataset = client.post(
+        f"/projects/{project['id']}/datasets", headers=owner_headers,
+        json={"name": "Scenes", "description": ""},
+    ).json()
+    asset = client.post(
+        f"/datasets/{dataset['id']}/assets", headers=owner_headers,
+        files={"file": ("diagnostic-scene.tif", geotiff_bytes(), "image/tiff")},
+    ).json()
+    task = client.post(f"/projects/{project['id']}/tasks", headers=owner_headers, json={
+        "title": "Compare building labels", "dataset_id": dataset["id"], "asset_id": asset["id"],
+        "crs": "EPSG:4326", "taxonomy": ["building", "road"], "target_annotator_count": 2,
+    }).json()
+    assignment = client.post(
+        f"/work/tasks/{task['id']}/assignments", headers=owner_headers, json={"user_ids": worker_ids},
+    )
+    assert assignment.status_code == 200, assignment.text
+
+    empty_consensus = client.get(
+        f"/work/tasks/{task['id']}/review-diagnostics?reference=consensus", headers=owner_headers,
+    )
+    assert empty_consensus.json()["reason"] == "no_submissions"
+    first_submit = client.post(
+        f"/work/tasks/{task['id']}/annotations", headers=worker_headers[0],
+        json={"geojson": polygon_collection(category="building")},
+    )
+    assert first_submit.status_code == 200, first_submit.text
+    insufficient_consensus = client.get(
+        f"/work/tasks/{task['id']}/review-diagnostics?reference=consensus", headers=owner_headers,
+    )
+    assert insufficient_consensus.json()["reason"] == "insufficient_independent_annotations"
+    second_submit = client.post(
+        f"/work/tasks/{task['id']}/annotations", headers=worker_headers[1],
+        json={"geojson": polygon_collection(category="building")},
+    )
+    assert second_submit.status_code == 200, second_submit.text
+
+    missing_gold = client.get(
+        f"/work/tasks/{task['id']}/review-diagnostics?reference=gold", headers=owner_headers,
+    )
+    assert missing_gold.status_code == 200
+    assert missing_gold.json()["available"] is False
+    assert missing_gold.json()["reason"] == "gold_reference_unavailable"
+
+    saved_gold = client.put(
+        f"/work/tasks/{task['id']}/gold-standard", headers=owner_headers,
+        json={"geojson": polygon_collection(category="road")},
+    )
+    assert saved_gold.status_code == 200, saved_gold.text
+    gold = client.get(f"/work/tasks/{task['id']}/review-diagnostics?reference=gold", headers=owner_headers)
+    assert gold.status_code == 200, gold.text
+    assert gold.json()["available"] is True
+    assert gold.json()["reference_source"] == "independent_gold_reference"
+    assert gold.json()["scorer_configuration"]["iou_threshold"] == 0.5
+    assert all(row["diagnostics"][0]["status"] == "category_mismatch" for row in gold.json()["submissions"])
+
+    consensus = client.get(
+        f"/work/tasks/{task['id']}/review-diagnostics?reference=consensus", headers=owner_headers,
+    )
+    assert consensus.status_code == 200, consensus.text
+    assert consensus.json()["available"] is True
+    assert consensus.json()["reference_source"] == "heuristic_consensus"
+    assert consensus.json()["reference_feature_count"] == 1
+    assert consensus.json()["iaa_type"] == "cohens_kappa"
+    existing_consensus = client.get(f"/work/tasks/{task['id']}/consensus", headers=owner_headers)
+    assert consensus.json()["iaa_score"] == existing_consensus.json()["iaa_score"]
+    assert all(row["diagnostics"][0]["status"] == "matched" for row in consensus.json()["submissions"])
+
+    denied = client.get(
+        f"/work/tasks/{task['id']}/review-diagnostics?reference=gold", headers=worker_headers[0],
+    )
+    assert denied.status_code == 403

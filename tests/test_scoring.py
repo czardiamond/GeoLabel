@@ -4,6 +4,7 @@ from backend.scoring import (
     build_consensus_geojson,
     calculate_cohens_kappa,
     compute_iou,
+    compare_features_to_reference,
     scoring_configuration,
 )
 
@@ -97,3 +98,31 @@ def test_consensus_tie_is_stable_and_does_not_fabricate_a_majority():
 def test_equal_score_matching_uses_stable_index_tie_break():
     candidates = [(0.8, 1, 1), (0.8, 0, 1), (0.8, 0, 0)]
     assert _greedy_global_match(candidates) == [(0, 0), (1, 1)]
+
+
+def test_feature_diagnostics_report_category_and_presence_disagreements():
+    diagnostics = compare_features_to_reference(
+        [polygon(0, "building"), polygon(0.03, "road")],
+        [polygon(0, "road"), polygon(0.06, "road")],
+        crs="EPSG:4326",
+    )
+    by_status = {item["status"]: item for item in diagnostics}
+    assert by_status["category_mismatch"]["feature_index"] == 0
+    assert by_status["category_mismatch"]["reference_feature_index"] == 0
+    assert by_status["category_mismatch"]["overlap_score"] == 1.0
+    assert by_status["unmatched_submission"]["feature_index"] == 1
+    assert by_status["unmatched_reference"]["reference_feature_index"] == 1
+
+
+def test_feature_diagnostics_preserve_original_indexes_after_canonical_sort():
+    diagnostics = compare_features_to_reference(
+        [polygon(0.02, "road"), polygon(0, "building")],
+        [polygon(0, "building"), polygon(0.02, "road")],
+        crs="EPSG:4326",
+    )
+    pairs = sorted(
+        (item["feature_index"], item["reference_feature_index"])
+        for item in diagnostics
+        if item["status"] == "matched"
+    )
+    assert pairs == [(0, 1), (1, 0)]
