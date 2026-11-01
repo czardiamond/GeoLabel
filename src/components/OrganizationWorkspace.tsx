@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { AlertCircle, Check, ChevronDown, Clipboard, Download, Image as ImageIcon, LogOut, MapPin, Plus, Redo2, RefreshCw, Send, ShieldCheck, Undo2, Upload, X } from 'lucide-react';
 import { upload as uploadPrivateBlob } from '@vercel/blob/client';
-import { normalizeApiBase } from '../lib/api';
+import { normalizeApiBase, readApiResponse } from '../lib/api';
 import { interpolateTrack, type VideoTrack as VideoTrackData, type VideoTrackCoordinates, type VideoTrackKind } from '../lib/videoTracks';
 import { emptyEditHistory, isTextEntryTarget, recordEdit, redoEdit, undoEdit, type EditHistory } from '../lib/annotationHistory';
 import { componentMask, eraseStroke, fillEnclosed, mergeMasks, splitMaskComponents } from '../lib/pixelMasks.ts';
@@ -64,7 +64,7 @@ export default function OrganizationWorkspace() {
  const [maskBrushSize,setMaskBrushSize]=useState(18), [maskCanvasRevision,setMaskCanvasRevision]=useState(0), [aiSuggestionsReviewed,setAiSuggestionsReviewed]=useState(false);
  const draftVersionsRef=useRef(new Map<string,number>()), draftQueueRef=useRef<{taskId:string;draft:any}|null>(null), draftSaveInFlightRef=useRef(false), draftActiveTaskRef=useRef<string|null>(null);
  const api = useCallback((path:string, init:RequestInit={}) => { const url = normalizeApiBase(base).replace(/\/$/,''); const headers = new Headers(init.headers); if (token) headers.set('Authorization',`Bearer ${token}`); if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type','application/json'); return fetch(`${url}${path}`,{...init,headers}); },[base,token]);
- const request = useCallback(async <T,>(path:string, init:RequestInit={}):Promise<T> => { const r=await api(path,init); const text=await r.text(); let body:any=null; try { body=text?JSON.parse(text):null; } catch { body=text; } if(!r.ok) throw new Error(body?.detail||body?.message||body||`Request failed (${r.status})`); return body as T; },[api]);
+ const request = useCallback(async <T,>(path:string, init:RequestInit={}):Promise<T> => readApiResponse<T>(await api(path,init)),[api]);
  const binary = useCallback(async (path:string) => { const r=await api(path); if(!r.ok) { const text=await r.text(); throw new Error(text || `Request failed (${r.status})`); } return r.blob(); },[api]);
  const replaceFeatures=(next:Feature[])=>{featuresRef.current=next;setFeatureState(next);setSelectedMaskIndices([]);setSelectedFeature(null);editHistoryRef.current=emptyEditHistory();setEditHistory(editHistoryRef.current);setEditorDirty(false);};
  const previewFeatures=(update:Feature[]|((current:Feature[])=>Feature[]))=>{const next=typeof update==='function'?update(featuresRef.current):update;featuresRef.current=next;setFeatureState(next);};

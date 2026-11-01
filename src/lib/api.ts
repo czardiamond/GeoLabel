@@ -29,3 +29,38 @@ export function normalizeApiBase(value: string): string {
   while (normalized.endsWith('/')) normalized = normalized.slice(0, -1);
   return normalized;
 }
+
+export function formatApiError(body: unknown, status: number): string {
+  const message = (value: unknown, depth = 0): string => {
+    if (depth > 5) return '';
+    if (typeof value === 'string') return value.trim();
+    if (Array.isArray(value)) return value.map(item => message(item, depth + 1)).filter(Boolean).join('; ');
+    if (!value || typeof value !== 'object') return '';
+
+    const error = value as Record<string, unknown>;
+    for (const key of ['detail', 'message', 'msg', 'error']) {
+      const text = message(error[key], depth + 1);
+      if (!text) continue;
+      if (key === 'msg' && Array.isArray(error.loc)) {
+        const path = error.loc.filter((part): part is string | number => typeof part === 'string' || typeof part === 'number');
+        if (['body', 'query', 'path', 'header', 'cookie'].includes(String(path[0]))) path.shift();
+        const field = path.join('.').replace(/_/g, ' ');
+        if (field) return `${field.charAt(0).toUpperCase()}${field.slice(1)}: ${text}`;
+      }
+      return text;
+    }
+    return '';
+  };
+
+  // Validation bodies can contain passwords/tokens in `input` or `ctx`.
+  // Read only recognized message fields; never stringify the whole response.
+  return message(body) || `Request failed (${status})`;
+}
+
+export async function readApiResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  let body: unknown = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!response.ok) throw new Error(formatApiError(body, response.status));
+  return body as T;
+}
