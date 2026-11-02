@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, HttpUrl, ValidationError, field_validator
 import pyproj
@@ -1688,6 +1688,54 @@ def get_task_consensus(task_id: str, member: MemberContext = Depends(require_mem
             "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus,
             "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
             "reference_source": "independent worker submissions; agreement is not an accuracy guarantee"}
+
+
+@router.get("/work/tasks/{task_id}/consensus/export")
+def export_task_consensus_geojson(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    """Download majority-supported consensus as RFC 7946 GeoJSON in CRS84."""
+    task, membership = _task_for_member(db, task_id, member)
+    require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    if task.task_type == "video":
+        raise HTTPException(status_code=415, detail="Video tasks do not have a GeoJSON consensus export.")
+    if not task.crs:
+        raise HTTPException(status_code=422, detail="A source CRS is required to create an interoperable GeoJSON export.")
+    rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
+    if len(rows) < 2:
+        raise HTTPException(status_code=409, detail="Consensus export requires at least two independent annotations.")
+    ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
+    score, _ = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
+    consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
+    try:
+        transformed = reproject_feature_collection(consensus, "OGC:CRS84")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Consensus cannot be transformed to WGS 84 longitude/latitude: {exc}") from exc
+    export_geojson = {"type": "FeatureCollection", "features": transformed.get("features", [])}
+
+    def positions(value):
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2 and isinstance(value[0], (int, float)) and isinstance(value[1], (int, float)):
+                yield value
+            else:
+                for item in value:
+                    yield from positions(item)
+
+    for feature in export_geojson["features"]:
+        geometry = feature.get("geometry") if isinstance(feature, dict) else None
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        for position in positions(coordinates):
+            if (not all(math.isfinite(float(value)) for value in position[:2])
+                    or not -180 <= position[0] <= 180 or not -90 <= position[1] <= 90):
+                raise HTTPException(status_code=422, detail="Consensus coordinates fall outside RFC 7946 WGS 84 longitude/latitude ranges.")
+    content = json.dumps(export_geojson, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(content) > settings.MAX_ANNOTATION_SUBMISSION_BYTES:
+        raise HTTPException(status_code=413, detail="Consensus GeoJSON exceeds the configured annotation-size limit.")
+    audit(db, membership.organization_id, member.user_id, "task.consensus_exported", "task", task.id,
+          {"feature_count": len(export_geojson["features"]), "source_crs": task.crs,
+           "target_crs": "OGC:CRS84", "bytes": len(content)})
+    db.commit()
+    filename = f"geolabel-{safe_filename(task.title or 'task')}-consensus.geojson"
+    return Response(content=content, media_type="application/geo+json",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.get("/work/tasks/{task_id}/review-diagnostics")

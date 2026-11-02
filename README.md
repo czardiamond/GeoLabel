@@ -178,6 +178,7 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `PUT` | `/work/tasks/{id}/gold-standard` | Reviewer/admin | Save independent reference data |
 | `GET` | `/work/tasks/{id}/quality` | Reviewer/admin/analyst | Per-annotator gold-set metrics |
 | `GET` | `/work/tasks/{id}/consensus` | Owner/admin/reviewer/analyst | Majority-supported GeoJSON and inter-annotator agreement |
+| `GET` | `/work/tasks/{id}/consensus/export` | Owner/admin/reviewer/analyst | Download bounded RFC 7946 GeoJSON reprojected to WGS 84 longitude/latitude |
 | `GET` | `/work/tasks/{id}/review-diagnostics?reference=gold\|consensus` | Owner/admin/reviewer/analyst | Bounded feature-level heuristic comparison against gold or worker consensus |
 | `POST` | `/organizations/{id}/gis/spatial-join` | Owner/admin/reviewer/analyst | CRS-aware local GeoJSON spatial join |
 | `POST` | `/assets/{id}/raster/statistics` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF band statistics |
@@ -231,6 +232,8 @@ No billing provider is configured by this code, and it neither charges users nor
 The organization workflow API now includes `POST /organizations/{organization_id}/gis/validate`. An authenticated organization member can submit a GeoJSON `FeatureCollection`, an explicit CRS identifier, and optional required property names. The report returns geometry counts, feature-level errors and warnings, and the exact checks performed. Requests are limited to 500 features, 100,000 coordinates, and 2 MB; invalid records are reported rather than silently repaired. The check covers feature structure, finite 2D/3D coordinates, supported geometry types, ring closure, Shapely topology, duplicate IDs when present, optional required fields, and WGS84 coordinate ranges when the CRS is EPSG:4326. It does **not** certify semantic label correctness, agreement with ground truth, or fitness for a particular project.
 
 RFC 7946 GeoJSON uses WGS 84 longitude/latitude coordinates (CRS84 order). GeoLabel's internal API and MCP additionally accept an explicit project CRS as an application-level extension; callers must supply the real source CRS, and should reproject to CRS84 when producing interoperable RFC 7946 GeoJSON. An explicit projected CRS does not make a payload RFC 7946-conformant.
+
+Reviewers, analysts, owners, and admins can download task consensus from `/work/tasks/{id}/consensus/export`. The export is reprojected from the task CRS to CRS84 longitude/latitude, omits the obsolete GeoJSON `crs` member, checks WGS 84 coordinate ranges, and is bounded by `MAX_ANNOTATION_SUBMISSION_BYTES`. It requires at least two independent non-video annotations. The output remains a heuristic, agreement-supported reference—not ground truth or a correctness guarantee.
 
 A local MCP server exposes the same tested GIS functions over the official MCP Python SDK's stdio transport. Install the backend and optional MCP dependencies, then configure an MCP host to run the module from the repository root:
 
