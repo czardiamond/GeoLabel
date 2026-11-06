@@ -219,8 +219,36 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
         json={"source": "external-detector", "model_version": "detector-v2", "geojson": polygon_collection()},
     )
     assert suggestion.status_code == 201, suggestion.text
-    decision = client.post(
+    from backend import workflows
+    from backend.models import PreAnnotation, utcnow_naive
+
+    original_locked_preannotation = workflows._locked_preannotation
+    def reject_before_preannotation_lock(db, preannotation_id):
+        with session_factory() as concurrent_db:
+            competing = concurrent_db.query(PreAnnotation).filter_by(id=preannotation_id).one()
+            competing.status = "rejected"
+            competing.reviewed_by_user_id = owner_session["user"]["id"]
+            competing.reviewed_at = utcnow_naive()
+            concurrent_db.commit()
+        return original_locked_preannotation(db, preannotation_id)
+
+    monkeypatch.setattr(workflows, "_locked_preannotation", reject_before_preannotation_lock)
+    stale_accept = client.post(
         f"/work/preannotations/{suggestion.json()['id']}/decision", headers=owner_headers,
+        json={"decision": "accept"},
+    )
+    assert stale_accept.status_code == 409
+    with session_factory() as db:
+        assert db.query(PreAnnotation).filter_by(id=suggestion.json()["id"]).one().status == "rejected"
+    monkeypatch.setattr(workflows, "_locked_preannotation", original_locked_preannotation)
+
+    accepted_suggestion = client.post(
+        f"/work/tasks/{task['id']}/preannotations", headers=owner_headers,
+        json={"source": "external-detector", "model_version": "detector-v2", "geojson": polygon_collection()},
+    )
+    assert accepted_suggestion.status_code == 201, accepted_suggestion.text
+    decision = client.post(
+        f"/work/preannotations/{accepted_suggestion.json()['id']}/decision", headers=owner_headers,
         json={"decision": "accept"},
     )
     assert decision.status_code == 200

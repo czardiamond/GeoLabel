@@ -124,6 +124,19 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     first_revision = client.post(f"/work/tasks/{task_id}/annotations", headers=workers[0],
                                  json={"geojson": polygon_collection()})
     assert first_revision.status_code == 200
+    partial_consensus = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers)
+    assert partial_consensus.status_code == 200
+    assert partial_consensus.json()["available"] is False
+    assert partial_consensus.json()["reason"] == "submissions_under_rework"
+    assert partial_consensus.json()["geojson"]["features"] == []
+    partial_diagnostics = client.get(
+        f"/work/tasks/{task_id}/review-diagnostics?reference=consensus", headers=owner_headers,
+    )
+    assert partial_diagnostics.status_code == 200
+    assert partial_diagnostics.json()["available"] is False
+    assert partial_diagnostics.json()["reason"] == "submissions_under_rework"
+    assert client.get(f"/work/tasks/{task_id}/consensus/export", headers=owner_headers).status_code == 409
+    assert client.get(f"/work/tasks/{task_id}/consensus/export.gpkg", headers=owner_headers).status_code == 409
     assert first_revision.json()["review_status"] == "not_started"
     second_revision = client.post(f"/work/tasks/{task_id}/annotations", headers=workers[1],
                                   json={"geojson": polygon_collection()})

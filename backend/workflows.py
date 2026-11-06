@@ -508,6 +508,35 @@ def _locked_task(db: Session, task_id: str) -> Task:
     return task
 
 
+def _locked_preannotation(db: Session, preannotation_id: str) -> PreAnnotation:
+    item = db.query(PreAnnotation).filter(PreAnnotation.id == preannotation_id).with_for_update().populate_existing().first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Pre-annotation not found.")
+    return item
+
+
+def _latest_video_submissions(rows: list[VideoSegmentSubmission]) -> list[VideoSegmentSubmission]:
+    latest: dict[str, VideoSegmentSubmission] = {}
+    for row in rows:
+        previous = latest.get(row.user_id)
+        if previous is None or row.version > previous.version:
+            latest[row.user_id] = row
+    return sorted(latest.values(), key=lambda row: row.user_id)
+
+
+def _consensus_unavailability_reason(rows: list[Annotation]) -> str | None:
+    if not rows:
+        return "no_submissions"
+    statuses = {row.review_status for row in rows}
+    if "rework" in statuses:
+        return "submissions_under_rework"
+    if len(statuses) > 1 or not statuses.issubset({"pending", "accepted", "rejected"}):
+        return "inconsistent_submission_review_status"
+    if len(rows) < 2:
+        return "insufficient_independent_annotations"
+    return None
+
+
 def _require_task_assignment(task: Task, membership: OrganizationMembership, member: MemberContext, db: Session, check_reservation: bool = True) -> None:
     if membership.role != "annotator":
         return
@@ -1558,7 +1587,8 @@ def review_task(task_id: str, payload: ReviewDecision, member: MemberContext = D
     if task.review_status != "pending_review":
         raise HTTPException(status_code=409, detail="This task is not currently ready for review.")
     annotations = db.query(Annotation).filter(Annotation.task_id == task.id).all()
-    videos = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id == task.id).all()
+    video_rows = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id == task.id).all()
+    videos = _latest_video_submissions(video_rows)
     if not annotations and not videos:
         raise HTTPException(status_code=409, detail="A task needs at least one submitted annotation before review.")
     decision_map = {"accept": "accepted", "reject": "rejected", "rework": "rework"}
@@ -1681,18 +1711,22 @@ def get_task_consensus(task_id: str, member: MemberContext = Depends(require_mem
     require_roles(membership, "owner", "admin", "reviewer", "analyst")
     rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
     ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
-    available = task.task_type != "video" and len(ann_dicts) >= 2
+    reason = "video_geometry_not_supported" if task.task_type == "video" else _consensus_unavailability_reason(rows)
+    available = reason is None
     score, iaa_type = (None, "insufficient_annotations")
     empty = {"type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": task.crs}}, "features": []}
     consensus = empty
     if available:
         score, iaa_type = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
         consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
-    return {"task_id": task.id, "available": available, "annotation_count": len(ann_dicts),
-            "required_support": len(ann_dicts) // 2 + 1 if available else None,
-            "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus,
-            "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
-            "reference_source": "independent worker submissions; agreement is not an accuracy guarantee"}
+    response = {"task_id": task.id, "available": available, "annotation_count": len(ann_dicts),
+                "required_support": len(ann_dicts) // 2 + 1 if available else None,
+                "iaa_score": score, "iaa_type": iaa_type, "geojson": consensus,
+                "scorer_version": SCORER_VERSION, "scorer_configuration": scoring_configuration(),
+                "reference_source": "independent worker submissions; agreement is not an accuracy guarantee"}
+    if reason:
+        response["reason"] = reason
+    return response
 
 
 @router.get("/work/tasks/{task_id}/consensus/export")
@@ -1705,8 +1739,12 @@ def export_task_consensus_geojson(task_id: str, member: MemberContext = Depends(
     if not task.crs:
         raise HTTPException(status_code=422, detail="A source CRS is required to create an interoperable GeoJSON export.")
     rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
-    if len(rows) < 2:
-        raise HTTPException(status_code=409, detail="Consensus export requires at least two independent annotations.")
+    reason = _consensus_unavailability_reason(rows)
+    if reason:
+        detail = ("Consensus export requires at least two independent annotations."
+                  if reason == "insufficient_independent_annotations"
+                  else f"Consensus export is unavailable: {reason}.")
+        raise HTTPException(status_code=409, detail=detail)
     ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
     score, _ = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
     consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
@@ -1753,8 +1791,12 @@ def export_task_consensus_geopackage(task_id: str, member: MemberContext = Depen
     if not task.crs:
         raise HTTPException(status_code=422, detail="A project CRS is required to create a GeoPackage export.")
     rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
-    if len(rows) < 2:
-        raise HTTPException(status_code=409, detail="Consensus export requires at least two independent annotations.")
+    reason = _consensus_unavailability_reason(rows)
+    if reason:
+        detail = ("Consensus export requires at least two independent annotations."
+                  if reason == "insufficient_independent_annotations"
+                  else f"Consensus export is unavailable: {reason}.")
+        raise HTTPException(status_code=409, detail=detail)
     ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
     score, _ = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
     consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
@@ -1805,9 +1847,10 @@ def get_task_review_diagnostics(
         reference_source = "independent_gold_reference"
         interpretation = "A gold reference is organization-supplied and is not independently validated."
     else:
-        if len(rows) < 2:
+        reason = _consensus_unavailability_reason(rows)
+        if reason:
             return {"task_id": task.id, "available": False, "reference": reference,
-                    "reason": "insufficient_independent_annotations", "reference_geojson": empty,
+                    "reason": reason, "reference_geojson": empty,
                     "annotation_count": len(rows), "iaa_score": None, "iaa_type": iaa_type}
         annotation_rows = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
         iaa_score, iaa_type = compute_task_iaa(annotation_rows, task.taxonomy, crs=task.crs)
@@ -1891,6 +1934,7 @@ def decide_preannotation(preannotation_id: str, payload: PreAnnotationDecision, 
         raise HTTPException(status_code=404, detail="Pre-annotation not found.")
     task, membership = _task_for_member(db, item.task_id, member)
     require_roles(membership, "owner", "admin", "reviewer")
+    item = _locked_preannotation(db, preannotation_id)
     if item.status != "pending":
         raise HTTPException(status_code=409, detail="This pre-annotation has already been reviewed.")
     item.status = "accepted" if payload.decision == "accept" else "rejected"

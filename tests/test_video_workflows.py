@@ -113,7 +113,22 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
     still_pending = client.get(f"/work/tasks/{task['id']}", headers=owner_headers).json()
     assert still_pending["review_status"] == "pending_review"
     assert len(client.get(f"/work/tasks/{task['id']}/video-segments/history", headers=owner_headers).json()) == 1
+    returned = client.post(f"/work/tasks/{task['id']}/review", headers=owner_headers,
+                           json={"decision": "rework", "comment": "Refine the temporal labels."})
+    assert returned.status_code == 200
+    history_after_rework = client.get(f"/work/tasks/{task['id']}/video-segments/history", headers=owner_headers)
+    assert history_after_rework.json()[0]["review_status"] == "rework"
+    resubmitted = client.post(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers, json={
+        "segments": [{"start_ms": 120, "end_ms": min(700, asset["metadata"]["duration_ms"]),
+                      "category": "vehicle", "notes": "revised temporal label"}],
+    })
+    assert resubmitted.status_code == 201, resubmitted.text
+    assert resubmitted.json()["version"] == 2
     reviewed = client.post(f"/work/tasks/{task['id']}/review", headers=owner_headers,
                            json={"decision": "accept", "comment": "Temporal labels verified."})
     assert reviewed.status_code == 200
     assert reviewed.json()["review_status"] == "accepted"
+    final_history = client.get(f"/work/tasks/{task['id']}/video-segments/history", headers=owner_headers)
+    assert [(row["version"], row["review_status"]) for row in final_history.json()] == [
+        (1, "rework"), (2, "accepted"),
+    ]
