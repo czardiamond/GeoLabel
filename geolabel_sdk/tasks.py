@@ -96,7 +96,7 @@ class TasksResource:
         target_annotator_count: int = 2,
         webhook_url: Optional[str] = None,
     ) -> Task:
-        """Create a task record; imagery itself is not uploaded or copied."""
+        """Call legacy creation, which returns 409; use the member-authorized project task API instead."""
         uri = raster_uri or raster_url
         if not uri:
             raise ValueError("Must provide raster_uri or raster_url to create a task.")

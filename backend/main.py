@@ -36,7 +36,6 @@ from backend.schemas import (
     AnnotationSubmit,
     QuoteCreate,
     QuoteResponse,
-    TaskCreate,
     TaskResponse,
     TaskResultsResponse,
     WebhookRegister,
@@ -266,27 +265,16 @@ def create_quote_request(payload: QuoteCreate, db: Session = Depends(get_db)):
     return QuoteResponse(id=quote.id, status=quote.status, submitted_at=quote.created_at)
 
 
-@app.post(api_path("/tasks"), response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
-def create_task(
-    payload: TaskCreate,
-    db: Session = Depends(get_db),
-    authenticated: bool = Depends(verify_api_key),
-):
-    """Create a task record. Imagery URIs are stored; this endpoint does not ingest or copy imagery."""
-    webhook_url = str(payload.webhook_url) if payload.webhook_url else None
-    require_allowed_webhook(webhook_url)
-    new_task = Task(
-        raster_url=payload.raster_url,
-        crs=payload.crs,
-        target_annotator_count=payload.target_annotator_count,
-        webhook_url=webhook_url,
-        status="queued",
+@app.post(api_path("/tasks"), status_code=status.HTTP_409_CONFLICT)
+def create_task(authenticated: bool = Depends(verify_api_key)):
+    """Reject legacy task creation because it cannot attach a task to an organization project."""
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Legacy task creation is disabled because POST /tasks cannot establish an organization-scoped project, dataset, and asset. "
+            "Create tasks through POST /projects/{project_id}/tasks using an organization account with access to that project."
+        ),
     )
-    new_task.taxonomy = payload.taxonomy
-    db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
-    return new_task
 
 
 @app.get(api_path("/tasks/{task_id}"), response_model=TaskResponse)

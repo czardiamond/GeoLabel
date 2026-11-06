@@ -8,7 +8,7 @@ GeoLabel is a geospatial annotation service with a backward-compatible GeoJSON A
 
 ### Existing GeoJSON API (preserved)
 
-- Service-key-protected task creation and owner task/result reads.
+- Existing task reads/results, task-bound annotator credentials, annotations, and consensus remain compatible. Legacy `POST /tasks` now fails closed with `409 Conflict` because it cannot bind a task to an organization project, dataset, and asset.
 - One-time task-scoped annotator API credentials; keys are stored as SHA-256 hashes and can be revoked.
 - GeoJSON FeatureCollection submissions, taxonomy validation, CRS validation/reprojection, and the existing heuristic agreement/consensus output.
 - Saved project-scoping requests and optional allowlisted HTTPS webhooks.
@@ -17,7 +17,7 @@ GeoLabel is a geospatial annotation service with a backward-compatible GeoJSON A
 ### Organization accounts and access
 
 - Organizations, invited users, local password login, expiring/revocable bearer sessions, and roles: `owner`, `admin`, `annotator`, `reviewer`, and `analyst`.
-- Organization membership checks on the new project, dataset, asset, queue, review, and quality routes. Legacy service-key routes remain deployment-wide for compatibility and should not be shared with workers.
+- Organization membership checks on project, dataset, asset, queue, review, and quality routes. Legacy read/annotator routes remain deployment-wide for compatibility and should not be shared with workers; task creation must use the member-authorized project route.
 - Invitation tokens are returned once with `delivery: "manual"`; there is no transactional email provider in this branch. Deliver invitation tokens through an approved channel and treat them as secrets.
 - Persistent audit events for organization, invitation, project, dataset, asset, task, annotation, review, gold-standard, and pre-annotation operations. In-app notifications are stored and can be marked read.
 - Audit records are append-only through the API. Owner/admins can create a private organization ZIP export with workflow data, media and audit provenance; credentials are excluded. This is not a deletion or retention policy.
@@ -86,7 +86,7 @@ The scoring implementation is **heuristic**. Version `geolabel-reference-agreeme
 | `reviewer` | Review queue, task assignment/reassignment, accept/reject/rework, gold data, consensus/quality review, imported pre-annotation review, task discussion |
 | `analyst` | Read organization data and quality metrics; no task creation, annotation or review actions |
 
-Role checks apply to the new `/organizations`, `/projects`, `/datasets`, `/assets`, and `/work` flows. The legacy `/tasks` and `/annotators` endpoints still use the deployment-wide service key to preserve backward compatibility; keep that key in an owner/admin environment only.
+Role checks apply to the `/organizations`, `/projects`, `/datasets`, `/assets`, and `/work` flows. The legacy `/tasks` create route requires the deployment-wide service key but returns `409 Conflict`; use `POST /projects/{id}/tasks` with an owner/admin session to create scoped work. Existing legacy task reads/results and `/annotators` administration still use the service key, which must remain in an owner/admin environment only.
 
 ## Configuration
 
@@ -188,7 +188,7 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `POST` | `/organizations/{id}/gis/raster-change` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF change analysis |
 | `POST` / `GET` | `/work/tasks/{id}/preannotations` | Reviewer/admin / task member | Import/list reviewable provider suggestions |
 | `POST` | `/work/preannotations/{id}/decision` | Reviewer/admin | Accept/reject a suggestion |
-| `POST` | `/tasks` | Service key | Legacy task creation |
+| `POST` | `/tasks` | Service key | `409 Conflict`; use member-authorized `/projects/{id}/tasks` so the task is attached to scoped project data |
 | `POST` | `/annotators/register` | Service key | Legacy task-bound worker key |
 | `GET` | `/tasks/{id}/results` | Service key | Legacy heuristic consensus GeoJSON |
 | `POST` | `/tasks/{id}/annotations` | Assigned annotator key | Legacy GeoJSON submission |
