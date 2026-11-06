@@ -44,7 +44,7 @@ from backend.blob_storage import (
     key_from_pathname,
 )
 from backend.gis_operations import raster_band_statistics, raster_change_analysis, raster_zonal_statistics, spatial_join
-from backend.mask_utils import polygonize_png_mask
+from backend.mask_utils import MAX_SPARSE_SUBMISSION_PAINTED_PIXELS, polygonize_png_mask, polygonize_sparse_mask
 from backend.auth import get_current_annotator
 from backend.config import settings
 from backend.database import get_db
@@ -684,14 +684,36 @@ def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
     ]
     if len(masks) > 200:
         raise HTTPException(status_code=413, detail="An annotation may contain at most 200 pixel-mask strokes.")
-    total_mask_bytes = sum(
-        (len(feature["properties"]["raster_mask"].get("data", "")) * 3 // 4)
-        for _, feature in masks
-        if isinstance(feature["properties"]["raster_mask"], dict)
-        and isinstance(feature["properties"]["raster_mask"].get("data"), str)
-    )
+    total_mask_bytes = 0
+    total_sparse_pixels = 0
+    for _, feature in masks:
+        raster_mask = feature["properties"]["raster_mask"]
+        if not isinstance(raster_mask, dict):
+            continue
+        if raster_mask.get("version") == 1 and isinstance(raster_mask.get("data"), str):
+            mask_bytes = len(raster_mask["data"]) * 3 // 4
+        elif raster_mask.get("version") == 2:
+            try:
+                mask_bytes = len(json.dumps(raster_mask, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            except (TypeError, ValueError, RecursionError):
+                mask_bytes = 0  # The mask decoder below returns the validation error.
+            if mask_bytes > 2_000_000:
+                raise HTTPException(status_code=413, detail="A sparse pixel mask exceeds the 2 MB per-mask limit.")
+            runs = raster_mask.get("rows")
+            if isinstance(runs, list):
+                total_sparse_pixels += sum(
+                    run[2] - run[1] for run in runs
+                    if isinstance(run, (list, tuple)) and len(run) == 3
+                    and all(isinstance(value, int) and not isinstance(value, bool) for value in run)
+                    and run[2] > run[1]
+                )
+                if total_sparse_pixels > MAX_SPARSE_SUBMISSION_PAINTED_PIXELS:
+                    raise HTTPException(status_code=413, detail="Sparse pixel masks exceed the 50-million painted-pixel per-submission limit.")
+        else:
+            mask_bytes = 0
+        total_mask_bytes += mask_bytes
     if total_mask_bytes > 8_000_000:
-        raise HTTPException(status_code=413, detail="Pixel-mask PNG data exceeds the 8 MB per-submission limit.")
+        raise HTTPException(status_code=413, detail="Pixel-mask data exceeds the 8 MB per-submission limit.")
     try:
         validate_annotation_submission(geojson, get_feature_collection_crs(geojson))
     except ValueError as exc:
@@ -719,8 +741,10 @@ def _check_annotation_geojson(task: Task, geojson: dict, db: Session) -> dict:
                     continue
                 properties = feature.get("properties") or {}
                 try:
-                    geometry = polygonize_png_mask(
-                        properties["raster_mask"], expected_width=asset.width, expected_height=asset.height,
+                    raster_mask = properties["raster_mask"]
+                    polygonizer = polygonize_sparse_mask if isinstance(raster_mask, dict) and raster_mask.get("version") == 2 else polygonize_png_mask
+                    geometry = polygonizer(
+                        raster_mask, expected_width=asset.width, expected_height=asset.height,
                         affine_transform=metadata.get("affine_transform"), bounds=asset.bounds,
                         source_crs=asset.crs or task.crs, target_crs=task.crs,
                     )

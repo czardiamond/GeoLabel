@@ -1,4 +1,5 @@
 import base64
+import json
 from io import BytesIO
 
 from PIL import Image
@@ -73,6 +74,55 @@ def test_image_annotation_mask_uses_source_affine_and_task_crs(api_client, tmp_p
     bounds = shape(feature["geometry"]).bounds
     # Three painted pixels occupy columns 0–2 and rows 0–2 in the source/task CRS.
     assert bounds == (10.0, 14.0, 14.0, 20.0)
+
+
+def test_sparse_mask_submission_on_10980_raster_preserves_vector_geometry(api_client, tmp_path, monkeypatch):
+    client, session_factory = api_client
+    from backend.config import settings
+    from backend.models import Annotation, Asset
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "sparse-mask-assets"))
+    organization, _, owner_headers = create_org_and_owner(client, "Sparse masks", "sparse-mask-owner@example.com")
+    project = client.post(f"/organizations/{organization['id']}/projects", headers=owner_headers,
+                          json={"name": "Large raster project", "description": ""}).json()
+    dataset = client.post(f"/projects/{project['id']}/datasets", headers=owner_headers,
+                          json={"name": "Large raster dataset", "description": ""}).json()
+    asset = client.post(f"/datasets/{dataset['id']}/assets", headers=owner_headers,
+                        files={"file": ("small.png", _png(), "image/png")},
+                        data={"crs": "EPSG:3857", "bounds": "[0,0,3,2]"}).json()
+    width = height = 10_980
+    with session_factory() as db:
+        source = db.query(Asset).filter_by(id=asset["id"]).one()
+        source.width = width
+        source.height = height
+        source.crs = "EPSG:3857"
+        source.bounds_json = json.dumps([0, 0, width, height])
+        source.metadata_json = json.dumps({"affine_transform": [1, 0, 0, 0, -1, height]})
+        db.commit()
+    task = client.post(f"/projects/{project['id']}/tasks", headers=owner_headers, json={
+        "title": "Sparse mask task", "dataset_id": dataset["id"], "asset_id": asset["id"],
+        "crs": "EPSG:3857", "taxonomy": ["tree", "road"], "target_annotator_count": 1,
+    }).json()
+    mask = {"version": 2, "encoding": "application/vnd.geolabel.pixel-runs+json",
+            "width": width, "height": height,
+            "rows": [[10_978, 10_978, 10_980], [10_979, 10_978, 10_980]]}
+    vector = {"type": "Feature", "properties": {"category": "road"},
+              "geometry": {"type": "Polygon", "coordinates": [[[100, 100], [110, 100], [110, 110], [100, 100]]]}}
+    response = client.post(f"/work/tasks/{task['id']}/annotations", headers=owner_headers, json={
+        "geojson": {"type": "FeatureCollection", "crs": {"type": "name", "properties": {"name": "EPSG:3857"}},
+                    "features": [
+                        {"type": "Feature", "properties": {"category": "tree", "raster_mask": mask},
+                         "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}},
+                        vector,
+                    ]},
+    })
+    assert response.status_code == 200, response.text
+    with session_factory() as db:
+        saved = db.query(Annotation).filter_by(task_id=task["id"]).one().geojson
+    mask_feature, vector_feature = saved["features"]
+    assert mask_feature["properties"]["raster_mask"] == mask
+    assert shape(mask_feature["geometry"]).bounds == (10_978, 0, 10_980, 2)
+    assert vector_feature["geometry"] == vector["geometry"]
 
 
 def test_rejects_mask_dimensions_that_do_not_match_the_source_asset(api_client, tmp_path, monkeypatch):

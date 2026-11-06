@@ -50,6 +50,14 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     assert client.get(f"/work/tasks/{task_id}/asset/preview", headers=outsider_headers).status_code == 403
     assert client.post(f"/work/tasks/{task_id}/annotations", headers=outsider_headers,
                        json={"geojson": polygon_collection()}).status_code == 403
+    sparse_probe = {"version": 2, "encoding": "application/vnd.geolabel.pixel-runs+json",
+                    "width": 1, "height": 1, "rows": [[0, 0, 1]]}
+    assert client.post(f"/work/tasks/{task_id}/annotations", headers=outsider_headers, json={
+        "geojson": {"type": "FeatureCollection", "features": [
+            {"type": "Feature", "properties": {"category": "building", "raster_mask": sparse_probe},
+             "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}}
+        ]},
+    }).status_code == 403
 
     first_queue = client.get(f"/organizations/{org['id']}/queue?view=annotate", headers=workers[0])
     assert any(task["id"] == task_id for task in first_queue.json())
