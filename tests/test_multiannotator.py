@@ -93,6 +93,21 @@ def test_two_annotators_submit_independently_and_reviewer_gets_majority_consensu
     all_submissions = client.get(f"/work/tasks/{task_id}/annotations", headers=owner_headers)
     assert sorted(row["annotator_id"] for row in all_submissions.json()) == sorted(worker_ids)
 
+    ready_task_before_late_submission = client.get(f"/work/tasks/{task_id}", headers=owner_headers).json()
+    consensus_before_late_submission = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers).json()
+    late_owner_submission = client.post(f"/work/tasks/{task_id}/annotations", headers=owner_headers,
+                                        json={"geojson": polygon_collection()})
+    assert late_owner_submission.status_code == 409
+    assert "pending review" in late_owner_submission.json()["detail"].lower()
+    ready_task_after_late_submission = client.get(f"/work/tasks/{task_id}", headers=owner_headers).json()
+    assert ready_task_after_late_submission["review_status"] == "pending_review"
+    assert ready_task_after_late_submission["status"] == ready_task_before_late_submission["status"]
+    assert ready_task_after_late_submission["iaa_score"] == ready_task_before_late_submission["iaa_score"]
+    submissions_after_late_attempt = client.get(f"/work/tasks/{task_id}/annotations", headers=owner_headers)
+    assert len(submissions_after_late_attempt.json()) == 2
+    consensus_after_late_attempt = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers).json()
+    assert consensus_after_late_attempt["geojson"] == consensus_before_late_submission["geojson"]
+
     consensus = client.get(f"/work/tasks/{task_id}/consensus", headers=owner_headers)
     assert consensus.status_code == 200, consensus.text
     body = consensus.json()

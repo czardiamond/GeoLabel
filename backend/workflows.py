@@ -1380,6 +1380,8 @@ def submit_org_annotation(task_id: str, payload: dict, member: MemberContext = D
     _require_task_assignment(task, membership, member, db, check_reservation=False)
     if task.reserved_by_user_id and task.reserved_until and task.reserved_until > utcnow_naive() and task.reserved_by_user_id != member.user_id and membership.role not in {"owner", "admin"}:
         raise HTTPException(status_code=409, detail="Another worker currently holds this task reservation.")
+    if task.review_status == "pending_review":
+        raise HTTPException(status_code=409, detail="This task is pending review. Ask a reviewer to request rework before changing submissions.")
     if task.review_status in {"accepted", "rejected"}:
         raise HTTPException(status_code=409, detail="This task has been closed by review.")
     geojson = _check_annotation_geojson(task, payload.get("geojson") if isinstance(payload, dict) else {}, db)
