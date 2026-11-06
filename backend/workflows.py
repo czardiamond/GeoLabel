@@ -500,7 +500,9 @@ def _task_for_member(db: Session, task_id: str, member: MemberContext) -> tuple[
 
 
 def _locked_task(db: Session, task_id: str) -> Task:
-    task = db.query(Task).filter(Task.id == task_id).with_for_update().first()
+    # _task_for_member may already have loaded this row into the session. Refresh
+    # it after taking the lock so concurrent commits cannot leave guarded fields stale.
+    task = db.query(Task).filter(Task.id == task_id).with_for_update().populate_existing().first()
     if not task:
         raise HTTPException(status_code=404, detail="Organization task not found.")
     return task
@@ -1909,6 +1911,8 @@ def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: Me
     asset = _task_asset(task, db)
     if asset.kind != "video" or task.task_type != "video":
         raise HTTPException(status_code=415, detail="Temporal segments can only be submitted for an uploaded video task.")
+    if task.review_status == "pending_review":
+        raise HTTPException(status_code=409, detail="This task is pending review. Ask a reviewer to request rework before changing submissions.")
     if task.review_status in {"accepted", "rejected"}:
         raise HTTPException(status_code=409, detail="This video task has been closed by review.")
     checked_segments = _check_video_segments(task, asset, payload.segments)

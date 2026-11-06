@@ -18,6 +18,13 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
     monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "private-video"))
     organization, _, owner_headers = create_org_and_owner(client, "Video review", "video-owner@example.com")
     org_id = organization["id"]
+    invitation = client.post(f"/organizations/{org_id}/invitations", headers=owner_headers,
+                             json={"email": "video-worker@example.com", "role": "annotator"})
+    worker_session = client.post("/auth/invitations/accept", json={
+        "token": invitation.json()["token"], "display_name": "Video Worker",
+        "password": "correct-horse-video-worker",
+    })
+    worker_headers = {"Authorization": f"Bearer {worker_session.json()['access_token']}"}
     project = client.post(f"/organizations/{org_id}/projects", headers=owner_headers,
                           json={"name": "Video project", "description": ""}).json()
     dataset = client.post(f"/projects/{project['id']}/datasets", headers=owner_headers,
@@ -44,6 +51,9 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
     })
     assert task_response.status_code == 201, task_response.text
     task = task_response.json()
+    assignment = client.post(f"/work/tasks/{task['id']}/assignments", headers=owner_headers,
+                             json={"user_ids": [worker_session.json()["user"]["id"]]})
+    assert assignment.status_code == 200, assignment.text
     too_long = client.post(f"/work/tasks/{task['id']}/video-segments", headers=owner_headers, json={
         "segments": [{"start_ms": 0, "end_ms": asset["metadata"]["duration_ms"] + 1000, "category": "vehicle", "notes": ""}],
     })
@@ -94,6 +104,15 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
     assert len(history.json()) == 1
     assert history.json()[0]["version"] == 1
     assert history.json()[0]["tracks"][0]["id"] == "vehicle-1"
+    late_video_submission = client.post(f"/work/tasks/{task['id']}/video-segments", headers=worker_headers, json={
+        "segments": [{"start_ms": 100, "end_ms": min(700, asset["metadata"]["duration_ms"]),
+                      "category": "vehicle", "notes": "must remain outside the review snapshot"}],
+    })
+    assert late_video_submission.status_code == 409
+    assert "pending review" in late_video_submission.json()["detail"].lower()
+    still_pending = client.get(f"/work/tasks/{task['id']}", headers=owner_headers).json()
+    assert still_pending["review_status"] == "pending_review"
+    assert len(client.get(f"/work/tasks/{task['id']}/video-segments/history", headers=owner_headers).json()) == 1
     reviewed = client.post(f"/work/tasks/{task['id']}/review", headers=owner_headers,
                            json={"decision": "accept", "comment": "Temporal labels verified."})
     assert reviewed.status_code == 200
