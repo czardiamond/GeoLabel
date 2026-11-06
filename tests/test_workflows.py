@@ -549,3 +549,67 @@ def test_task_asset_lineage_blocks_cross_organization_bytes_and_metadata(api_cli
         response = client.get(path, headers=headers)
         assert response.status_code == 404, f"{path} returned {response.status_code}: {response.text[:200]}"
         assert response.content != geotiff_bytes()
+
+
+def test_only_owners_can_grant_admin_role_through_invitation(api_client):
+    client, session_factory = api_client
+    from backend.models import OrganizationInvitation, OrganizationMembership
+
+    organization, _, owner_headers = create_org_and_owner(
+        client, "Invitation role policy", "invitation-policy-owner@example.com",
+    )
+    org_id = organization["id"]
+
+    admin_invite = client.post(
+        f"/organizations/{org_id}/invitations", headers=owner_headers,
+        json={"email": "invitation-policy-admin@example.com", "role": "admin"},
+    )
+    assert admin_invite.status_code == 201, admin_invite.text
+    admin_session = client.post("/auth/invitations/accept", json={
+        "token": admin_invite.json()["token"], "display_name": "Org Admin",
+        "password": "invitation-admin-password-1",
+    })
+    assert admin_session.status_code == 200, admin_session.text
+    admin_headers = {"Authorization": f"Bearer {admin_session.json()['access_token']}"}
+
+    denied = client.post(
+        f"/organizations/{org_id}/invitations", headers=admin_headers,
+        json={"email": "invitation-policy-escalation@example.com", "role": "admin"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Only an owner may grant administrator access."
+    with session_factory() as db:
+        assert db.query(OrganizationInvitation).filter_by(
+            organization_id=org_id, email="invitation-policy-escalation@example.com",
+        ).count() == 0
+
+    regular_invite = client.post(
+        f"/organizations/{org_id}/invitations", headers=admin_headers,
+        json={"email": "invitation-policy-worker@example.com", "role": "annotator"},
+    )
+    assert regular_invite.status_code == 201, regular_invite.text
+    worker_session = client.post("/auth/invitations/accept", json={
+        "token": regular_invite.json()["token"], "display_name": "Org Worker",
+        "password": "invitation-worker-password-1",
+    })
+    assert worker_session.status_code == 200, worker_session.text
+    worker_id = worker_session.json()["user"]["id"]
+    assert client.patch(
+        f"/organizations/{org_id}/members/{worker_id}", headers=admin_headers,
+        json={"role": "admin"},
+    ).status_code == 403
+
+    owner_grant = client.post(
+        f"/organizations/{org_id}/invitations", headers=owner_headers,
+        json={"email": "invitation-policy-second-admin@example.com", "role": "admin"},
+    )
+    assert owner_grant.status_code == 201, owner_grant.text
+    second_admin = client.post("/auth/invitations/accept", json={
+        "token": owner_grant.json()["token"], "display_name": "Second Admin",
+        "password": "invitation-admin-password-2",
+    })
+    assert second_admin.status_code == 200, second_admin.text
+    with session_factory() as db:
+        assert db.query(OrganizationMembership).filter_by(
+            organization_id=org_id, user_id=second_admin.json()["user"]["id"], role="admin",
+        ).one()

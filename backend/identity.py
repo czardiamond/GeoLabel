@@ -328,6 +328,8 @@ def invite_member(
 ):
     membership = membership_for(db, member.user_id, organization_id)
     require_roles(membership, "owner", "admin")
+    if membership.role != "owner" and payload.role == "admin":
+        raise HTTPException(status_code=403, detail="Only an owner may grant administrator access.")
     email = _normalize_email(str(payload.email))
     active = db.query(OrganizationMembership).join(UserAccount, UserAccount.id == OrganizationMembership.user_id).filter(
         OrganizationMembership.organization_id == organization_id, UserAccount.email == email
