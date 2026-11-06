@@ -65,6 +65,7 @@ Local uploads stream to disk and use `MAX_ASSET_UPLOAD_MB` (default 512 MiB). Ve
 - Task discussion comments and issue records, in-app notifications, and notification read state.
 - Reviewer-supplied gold FeatureCollections and per-worker class-aware precision, recall, F1, per-class counts, and category accuracy; quality can be used to filter the task queue. Gold-set quality uses scorer version `geolabel-reference-agreement-v3`.
 - Organization reviewers can inspect majority-supported consensus GeoJSON and inter-annotator agreement from the independent submissions; a consensus requires at least two annotations and uses the existing heuristic spatial matching/support threshold.
+- Authorized reviewers can download consensus as RFC 7946 GeoJSON in WGS 84 or as an OGC GeoPackage in the task CRS. GeoPackage includes readable SQLite attribute columns and a lossless `properties_json` value for each feature; its coordinates are not reprojected.
 - Reviewable pre-annotation records can be imported from an external provider, reviewed/accepted/rejected, and retrieved by workers. Optional configured vision-provider candidates use the same pending human-review preannotation workflow.
 - Raster analysis exposes per-band valid-pixel statistics, CRS-aware polygon zonal summaries, and baseline-to-later GeoTIFF change comparisons in the workspace. Change comparisons require identical dimensions, band counts, CRS, and affine transform; they do not resample or infer acquisition dates, physical units, or semantic change. Processing is pixel-bounded and results can be downloaded as JSON.
 - The dataset asset catalog shows GeoTIFF dimensions, CRS, bounds, pixel resolution, band count, data types, band descriptions, NoData values, and file size when supplied by the source file.
@@ -179,6 +180,7 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `GET` | `/work/tasks/{id}/quality` | Reviewer/admin/analyst | Per-annotator gold-set metrics |
 | `GET` | `/work/tasks/{id}/consensus` | Owner/admin/reviewer/analyst | Majority-supported GeoJSON and inter-annotator agreement |
 | `GET` | `/work/tasks/{id}/consensus/export` | Owner/admin/reviewer/analyst | Download bounded RFC 7946 GeoJSON reprojected to WGS 84 longitude/latitude |
+| `GET` | `/work/tasks/{id}/consensus/export.gpkg` | Owner/admin/reviewer/analyst | Download bounded OGC GeoPackage retaining the task CRS and feature attributes |
 | `GET` | `/work/tasks/{id}/review-diagnostics?reference=gold\|consensus` | Owner/admin/reviewer/analyst | Bounded feature-level heuristic comparison against gold or worker consensus |
 | `POST` | `/organizations/{id}/gis/spatial-join` | Owner/admin/reviewer/analyst | CRS-aware local GeoJSON spatial join |
 | `POST` | `/assets/{id}/raster/statistics` | Owner/admin/reviewer/analyst | Bounded local GeoTIFF band statistics |

@@ -50,6 +50,7 @@ from backend.database import get_db
 from backend.temp_storage import reserve_download
 from backend.geo_utils import get_feature_collection_crs, reproject_feature_collection
 from backend.geo_validation import validate_annotation_submission, validate_geojson_collection
+from backend.geopackage_export import build_consensus_geopackage
 from backend.inference import (
     MAX_IMAGE_BYTES,
     get_inference_status,
@@ -1735,6 +1736,36 @@ def export_task_consensus_geojson(task_id: str, member: MemberContext = Depends(
     db.commit()
     filename = f"geolabel-{safe_filename(task.title or 'task')}-consensus.geojson"
     return Response(content=content, media_type="application/geo+json",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/work/tasks/{task_id}/consensus/export.gpkg")
+def export_task_consensus_geopackage(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
+    """Download majority-supported consensus as a GeoPackage in the task CRS."""
+    task, membership = _task_for_member(db, task_id, member)
+    require_roles(membership, "owner", "admin", "reviewer", "analyst")
+    if task.task_type == "video":
+        raise HTTPException(status_code=415, detail="Video tasks do not have a GeoPackage consensus export.")
+    if not task.crs:
+        raise HTTPException(status_code=422, detail="A project CRS is required to create a GeoPackage export.")
+    rows = db.query(Annotation).filter(Annotation.task_id == task.id).order_by(Annotation.submitted_at.asc()).all()
+    if len(rows) < 2:
+        raise HTTPException(status_code=409, detail="Consensus export requires at least two independent annotations.")
+    ann_dicts = [{"annotator_id": row.annotator_id, "geojson": row.geojson} for row in rows]
+    score, _ = compute_task_iaa(ann_dicts, task.taxonomy, crs=task.crs)
+    consensus = build_consensus_geojson(ann_dicts, iaa_score=score, crs=task.crs)
+    try:
+        content = build_consensus_geopackage(consensus, task.crs)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"GeoPackage consensus export failed: {exc}") from exc
+    if len(content) > settings.MAX_ANNOTATION_SUBMISSION_BYTES:
+        raise HTTPException(status_code=413, detail="Consensus GeoPackage exceeds the configured annotation-size limit.")
+    audit(db, membership.organization_id, member.user_id, "task.consensus_geopackage_exported", "task", task.id,
+          {"feature_count": len(consensus.get("features", [])), "source_crs": task.crs,
+           "target_crs": task.crs, "bytes": len(content), "format": "GPKG"})
+    db.commit()
+    filename = f"geolabel-{safe_filename(task.title or 'task')}-consensus.gpkg"
+    return Response(content=content, media_type="application/geopackage+sqlite3",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
