@@ -107,3 +107,102 @@ def test_submission_refreshes_task_state_after_competing_completion(api_client, 
     assert history.status_code == 200, history.text
     assert len(history.json()["history"]) == 2
     assert all(row["current"] for row in history.json()["history"])
+
+
+def test_reviewer_decisions_refresh_membership_after_resource_lock(api_client, tmp_path, monkeypatch):
+    client, session_factory = api_client
+    from backend import workflows
+    from backend.config import settings
+    from backend.models import Annotation, AuditEvent, OrganizationMembership, PreAnnotation, Task
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "reviewer-role-race"))
+    organization, _, owner_headers = create_org_and_owner(
+        client, "Reviewer race", "reviewer-race-owner@example.com"
+    )
+    org_id = organization["id"]
+    invitation = client.post(
+        f"/organizations/{org_id}/invitations", headers=owner_headers,
+        json={"email": "reviewer-race-reviewer@example.com", "role": "reviewer"},
+    )
+    accepted_reviewer = client.post("/auth/invitations/accept", json={
+        "token": invitation.json()["token"], "display_name": "Review Race", "password": "correct-horse-review-race",
+    })
+    reviewer_id = accepted_reviewer.json()["user"]["id"]
+    reviewer_headers = {"Authorization": f"Bearer {accepted_reviewer.json()['access_token']}"}
+
+    project = client.post(f"/organizations/{org_id}/projects", headers=owner_headers,
+                          json={"name": "Review race project", "description": ""}).json()
+    dataset = client.post(f"/projects/{project['id']}/datasets", headers=owner_headers,
+                          json={"name": "Review race dataset", "description": ""}).json()
+    asset = client.post(
+        f"/datasets/{dataset['id']}/assets", headers=owner_headers,
+        files={"file": ("review-race.tif", geotiff_bytes(), "image/tiff")},
+    )
+    assert asset.status_code == 201, asset.text
+    task_response = client.post(f"/projects/{project['id']}/tasks", headers=owner_headers, json={
+        "title": "Review race task", "dataset_id": dataset["id"], "asset_id": asset.json()["id"],
+        "crs": "EPSG:4326", "taxonomy": ["building"], "target_annotator_count": 1,
+    })
+    assert task_response.status_code == 201, task_response.text
+    task_id = task_response.json()["id"]
+    submitted = client.post(f"/work/tasks/{task_id}/annotations", headers=owner_headers,
+                            json={"geojson": polygon_collection()})
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["review_status"] == "pending_review"
+    preannotation = client.post(f"/work/tasks/{task_id}/preannotations", headers=owner_headers, json={
+        "source": "local-test", "model_version": "v1", "geojson": polygon_collection(),
+    })
+    assert preannotation.status_code == 201, preannotation.text
+
+    original_locked_task = workflows._locked_task
+
+    def downgrade_reviewer_before_task_lock(db, locked_task_id):
+        assert locked_task_id == task_id
+        with session_factory() as concurrent_db:
+            membership = concurrent_db.query(OrganizationMembership).filter_by(
+                organization_id=org_id, user_id=reviewer_id
+            ).one()
+            membership.role = "annotator"
+            concurrent_db.commit()
+        return original_locked_task(db, locked_task_id)
+
+    monkeypatch.setattr(workflows, "_locked_task", downgrade_reviewer_before_task_lock)
+    rejected_task_decision = client.post(
+        f"/work/tasks/{task_id}/review", headers=reviewer_headers,
+        json={"decision": "accept", "comment": "Must not be accepted after revocation."},
+    )
+    assert rejected_task_decision.status_code == 403, rejected_task_decision.text
+    monkeypatch.setattr(workflows, "_locked_task", original_locked_task)
+
+    with session_factory() as db:
+        assert db.query(Task).filter_by(id=task_id).one().review_status == "pending_review"
+        assert db.query(Annotation).filter_by(task_id=task_id).one().review_status == "pending"
+        assert db.query(AuditEvent).filter_by(action="task.review.accept", resource_id=task_id).count() == 0
+
+    restored_role = client.patch(f"/organizations/{org_id}/members/{reviewer_id}", headers=owner_headers,
+                                 json={"role": "reviewer"})
+    assert restored_role.status_code == 200, restored_role.text
+    original_locked_preannotation = workflows._locked_preannotation
+
+    def downgrade_reviewer_before_preannotation_lock(db, preannotation_id):
+        assert preannotation_id == preannotation.json()["id"]
+        with session_factory() as concurrent_db:
+            membership = concurrent_db.query(OrganizationMembership).filter_by(
+                organization_id=org_id, user_id=reviewer_id
+            ).one()
+            membership.role = "annotator"
+            concurrent_db.commit()
+        return original_locked_preannotation(db, preannotation_id)
+
+    monkeypatch.setattr(workflows, "_locked_preannotation", downgrade_reviewer_before_preannotation_lock)
+    rejected_preannotation_decision = client.post(
+        f"/work/preannotations/{preannotation.json()['id']}/decision", headers=reviewer_headers,
+        json={"decision": "accept"},
+    )
+    assert rejected_preannotation_decision.status_code == 403, rejected_preannotation_decision.text
+
+    with session_factory() as db:
+        assert db.query(PreAnnotation).filter_by(id=preannotation.json()["id"]).one().status == "pending"
+        assert db.query(AuditEvent).filter_by(
+            action="preannotation.accepted", resource_id=preannotation.json()["id"]
+        ).count() == 0

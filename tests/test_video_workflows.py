@@ -132,3 +132,73 @@ def test_video_upload_and_temporal_segments_are_persisted_and_duration_checked(a
     assert [(row["version"], row["review_status"]) for row in final_history.json()] == [
         (1, "rework"), (2, "accepted"),
     ]
+
+
+def test_annotators_only_read_their_own_latest_video_submissions(api_client, tmp_path, monkeypatch):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg is not installed in this test environment")
+    client, session_factory = api_client
+    from backend.config import settings
+    from backend.models import VideoSegmentSubmission
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "video-private"))
+    organization, _, owner_headers = create_org_and_owner(client, "Video privacy", "video-privacy-owner@example.com")
+    workers = []
+    worker_ids = []
+    for index in range(2):
+        invitation = client.post(
+            f"/organizations/{organization['id']}/invitations", headers=owner_headers,
+            json={"email": f"video-privacy-{index}@example.com", "role": "annotator"},
+        )
+        accepted = client.post("/auth/invitations/accept", json={
+            "token": invitation.json()["token"], "display_name": f"Video Worker {index}",
+            "password": f"correct-horse-video-private-{index}",
+        })
+        workers.append({"Authorization": f"Bearer {accepted.json()['access_token']}"})
+        worker_ids.append(accepted.json()["user"]["id"])
+
+    project = client.post(f"/organizations/{organization['id']}/projects", headers=owner_headers,
+                          json={"name": "Private video project", "description": ""}).json()
+    dataset = client.post(f"/projects/{project['id']}/datasets", headers=owner_headers,
+                          json={"name": "Private video dataset", "description": ""}).json()
+    video_path = tmp_path / "private-sample.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+        "-i", "color=c=black:s=32x32:r=5:d=1", "-t", "1", "-c:v", "mpeg4",
+        "-pix_fmt", "yuv420p", str(video_path),
+    ], check=True, capture_output=True)
+    asset = client.post(
+        f"/datasets/{dataset['id']}/assets", headers=owner_headers,
+        files={"file": ("private-sample.mp4", video_path.read_bytes(), "video/mp4")},
+    )
+    assert asset.status_code == 201, asset.text
+    task_response = client.post(f"/projects/{project['id']}/tasks", headers=owner_headers, json={
+        "title": "Private temporal task", "dataset_id": dataset["id"], "asset_id": asset.json()["id"],
+        "crs": "EPSG:4326", "taxonomy": ["vehicle"], "target_annotator_count": 2,
+    })
+    assert task_response.status_code == 201, task_response.text
+    task_id = task_response.json()["id"]
+    assignments = client.post(f"/work/tasks/{task_id}/assignments", headers=owner_headers,
+                              json={"user_ids": worker_ids})
+    assert assignments.status_code == 200, assignments.text
+
+    with session_factory() as db:
+        for index, user_id in enumerate(worker_ids):
+            row = VideoSegmentSubmission(
+                task_id=task_id, user_id=user_id, version=1,
+                review_status="pending",
+            )
+            row.segments = [{"start_ms": 10, "end_ms": 100, "category": "vehicle", "notes": f"worker-{index}-private"}]
+            row.tracks = []
+            db.add(row)
+        db.commit()
+
+    first = client.get(f"/work/tasks/{task_id}/video-segments", headers=workers[0])
+    second = client.get(f"/work/tasks/{task_id}/video-segments", headers=workers[1])
+    owner = client.get(f"/work/tasks/{task_id}/video-segments", headers=owner_headers)
+    assert first.status_code == second.status_code == owner.status_code == 200
+    assert [item["user_id"] for item in first.json()] == [worker_ids[0]]
+    assert first.json()[0]["segments"][0]["notes"] == "worker-0-private"
+    assert [item["user_id"] for item in second.json()] == [worker_ids[1]]
+    assert second.json()[0]["segments"][0]["notes"] == "worker-1-private"
+    assert {item["user_id"] for item in owner.json()} == set(worker_ids)

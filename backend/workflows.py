@@ -499,6 +499,20 @@ def _task_for_member(db: Session, task_id: str, member: MemberContext) -> tuple[
     return task, membership_for(db, member.user_id, project.organization_id)
 
 
+def _locked_membership_for_task(db: Session, task: Task, member: MemberContext) -> OrganizationMembership:
+    if not task.project_id:
+        raise HTTPException(status_code=404, detail="Organization task not found.")
+    project = db.query(Project).filter(Project.id == task.project_id).populate_existing().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    membership = db.query(OrganizationMembership).filter_by(
+        user_id=member.user_id, organization_id=project.organization_id
+    ).with_for_update().populate_existing().first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="This account is not a member of that organization.")
+    return membership
+
+
 def _locked_task(db: Session, task_id: str) -> Task:
     # _task_for_member may already have loaded this row into the session. Refresh
     # it after taking the lock so concurrent commits cannot leave guarded fields stale.
@@ -587,7 +601,7 @@ def _assigned_user_ids(task: Task, db: Session) -> set[str]:
 
 
 def _task_response(task: Task, db: Session, include_quality: bool = False) -> dict:
-    asset = db.query(Asset).filter(Asset.id == task.asset_id).first() if task.asset_id else None
+    asset = _task_asset(task, db) if task.asset_id else None
     response = {
         "id": task.id, "title": task.title, "status": task.status, "review_status": task.review_status,
         "task_type": task.task_type, "raster_url": task.raster_url, "crs": task.crs,
@@ -617,9 +631,15 @@ def _can_edit(role: str):
 def _task_asset(task: Task, db: Session) -> Asset:
     if not task.asset_id:
         raise HTTPException(status_code=404, detail="This task has no uploaded asset.")
-    asset = db.query(Asset).filter(Asset.id == task.asset_id).first()
+    query = db.query(Asset).join(Dataset, Dataset.id == Asset.dataset_id).filter(
+        Asset.id == task.asset_id,
+        Dataset.project_id == task.project_id,
+    )
+    if task.dataset_id:
+        query = query.filter(Asset.dataset_id == task.dataset_id)
+    asset = query.first()
     if not asset:
-        raise HTTPException(status_code=404, detail="The task asset record is missing.")
+        raise HTTPException(status_code=404, detail="The task asset is missing or does not belong to this task's project and dataset.")
     return asset
 
 
@@ -1392,8 +1412,8 @@ def legacy_annotator_asset_preview(task_id: str, annotator_id: str = Depends(get
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task or not task.asset_id:
         raise HTTPException(status_code=404, detail="This task has no uploaded asset.")
-    asset = db.query(Asset).filter(Asset.id == task.asset_id).first()
-    if not asset or not asset.preview_key:
+    asset = _task_asset(task, db)
+    if not asset.preview_key:
         raise HTTPException(status_code=404, detail="This task asset has no raster preview.")
     path = resolve_storage_key(asset.preview_key)
     if not path.is_file():
@@ -1583,6 +1603,7 @@ def delete_task_draft(task_id: str, member: MemberContext = Depends(require_memb
 def review_task(task_id: str, payload: ReviewDecision, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
     task = _locked_task(db, task_id)
+    membership = _locked_membership_for_task(db, task, member)
     require_roles(membership, "owner", "admin", "reviewer")
     if task.review_status != "pending_review":
         raise HTTPException(status_code=409, detail="This task is not currently ready for review.")
@@ -1932,9 +1953,13 @@ def decide_preannotation(preannotation_id: str, payload: PreAnnotationDecision, 
     item = db.query(PreAnnotation).filter(PreAnnotation.id == preannotation_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="Pre-annotation not found.")
-    task, membership = _task_for_member(db, item.task_id, member)
-    require_roles(membership, "owner", "admin", "reviewer")
+    _task_for_member(db, item.task_id, member)
     item = _locked_preannotation(db, preannotation_id)
+    task = db.query(Task).filter(Task.id == item.task_id).populate_existing().first()
+    if not task or not task.project_id:
+        raise HTTPException(status_code=404, detail="Organization task not found.")
+    membership = _locked_membership_for_task(db, task, member)
+    require_roles(membership, "owner", "admin", "reviewer")
     if item.status != "pending":
         raise HTTPException(status_code=409, detail="This pre-annotation has already been reviewed.")
     item.status = "accepted" if payload.decision == "accept" else "rejected"
@@ -2002,15 +2027,19 @@ def submit_video_segments(task_id: str, payload: VideoSegmentsSubmit, member: Me
 @router.get("/work/tasks/{task_id}/video-segments")
 def list_video_segments(task_id: str, member: MemberContext = Depends(require_member), db: Session = Depends(get_db)):
     task, membership = _task_for_member(db, task_id, member)
-    _require_task_assignment(task, membership, member, db)
-    submissions = db.query(VideoSegmentSubmission).filter(VideoSegmentSubmission.task_id == task.id).order_by(
-        VideoSegmentSubmission.user_id.asc(), VideoSegmentSubmission.version.desc()
-    ).all()
-    latest = {}
-    for item in submissions:
-        latest.setdefault(item.user_id, item)
+    if membership.role == "annotator":
+        _require_task_assignment(task, membership, member, db)
+        submissions = db.query(VideoSegmentSubmission).filter_by(
+            task_id=task.id, user_id=member.user_id
+        ).order_by(VideoSegmentSubmission.version.desc()).all()
+    else:
+        require_roles(membership, "owner", "admin", "reviewer", "analyst")
+        submissions = db.query(VideoSegmentSubmission).filter_by(task_id=task.id).order_by(
+            VideoSegmentSubmission.user_id.asc(), VideoSegmentSubmission.version.desc()
+        ).all()
+    latest = _latest_video_submissions(submissions)
     return [{"user_id": item.user_id, "version": item.version, "segments": item.segments, "tracks": item.tracks,
-             "review_status": item.review_status, "submitted_at": item.submitted_at} for item in latest.values()]
+             "review_status": item.review_status, "submitted_at": item.submitted_at} for item in latest]
 
 
 @router.get("/work/tasks/{task_id}/video-segments/history")
@@ -2036,9 +2065,7 @@ def legacy_annotator_asset_content(task_id: str, annotator_id: str = Depends(get
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task or not task.asset_id:
         raise HTTPException(status_code=404, detail="This task has no uploaded asset.")
-    asset = db.query(Asset).filter(Asset.id == task.asset_id).first()
-    if not asset:
-        raise HTTPException(status_code=404, detail="This task asset is missing.")
+    asset = _task_asset(task, db)
     path = resolve_storage_key(asset.storage_key)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Asset file is missing from configured storage.")

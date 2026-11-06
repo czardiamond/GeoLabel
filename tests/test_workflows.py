@@ -489,3 +489,63 @@ def test_review_diagnostics_are_feature_level_bounded_and_reviewer_only(api_clie
         f"/work/tasks/{task['id']}/review-diagnostics?reference=gold", headers=worker_headers[0],
     )
     assert denied.status_code == 403
+
+
+def test_task_asset_lineage_blocks_cross_organization_bytes_and_metadata(api_client, tmp_path, monkeypatch):
+    client, session_factory = api_client
+    from backend.auth import generate_annotator_credentials
+    from backend.config import settings
+    from backend.models import AnnotatorApiKey, Task
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "tenant-assets"))
+    org_a, _, owner_a = create_org_and_owner(client, "Tenant A", "tenant-a-owner@example.com")
+    org_b, _, owner_b = create_org_and_owner(client, "Tenant B", "tenant-b-owner@example.com")
+
+    def create_project_asset(organization, headers, suffix):
+        project = client.post(
+            f"/organizations/{organization['id']}/projects", headers=headers,
+            json={"name": f"Project {suffix}", "description": ""},
+        )
+        assert project.status_code == 201, project.text
+        dataset = client.post(
+            f"/projects/{project.json()['id']}/datasets", headers=headers,
+            json={"name": f"Dataset {suffix}", "description": ""},
+        )
+        assert dataset.status_code == 201, dataset.text
+        asset = client.post(
+            f"/datasets/{dataset.json()['id']}/assets", headers=headers,
+            files={"file": (f"{suffix}.tif", geotiff_bytes(), "image/tiff")},
+        )
+        assert asset.status_code == 201, asset.text
+        return project.json(), dataset.json(), asset.json()
+
+    project_a, dataset_a, asset_a = create_project_asset(org_a, owner_a, "tenant-a")
+    _, _, asset_b = create_project_asset(org_b, owner_b, "tenant-b")
+    assert client.get(asset_b["content_path"], headers=owner_b).status_code == 200
+    assert client.get(asset_b["preview_path"], headers=owner_b).status_code == 200
+
+    created = client.post(f"/projects/{project_a['id']}/tasks", headers=owner_a, json={
+        "title": "Tenant A task", "dataset_id": dataset_a["id"], "asset_id": asset_a["id"],
+        "crs": "EPSG:4326", "taxonomy": ["building"], "target_annotator_count": 1,
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    annotator_id, raw_key, key_hash = generate_annotator_credentials()
+    with session_factory() as db:
+        task = db.query(Task).filter_by(id=task_id).one()
+        task.asset_id = asset_b["id"]  # Simulate an inconsistent legacy/database row.
+        db.add(AnnotatorApiKey(task_id=task_id, annotator_id=annotator_id, api_key_hash=key_hash))
+        db.commit()
+
+    legacy_headers = {"X-Annotator-API-Key": raw_key}
+    protected_paths = [
+        (f"/work/tasks/{task_id}", owner_a),
+        (f"/work/tasks/{task_id}/asset/preview", owner_a),
+        (f"/work/tasks/{task_id}/asset/content", owner_a),
+        (f"/annotator/tasks/{task_id}/asset", legacy_headers),
+        (f"/annotator/tasks/{task_id}/asset/content", legacy_headers),
+    ]
+    for path, headers in protected_paths:
+        response = client.get(path, headers=headers)
+        assert response.status_code == 404, f"{path} returned {response.status_code}: {response.text[:200]}"
+        assert response.content != geotiff_bytes()

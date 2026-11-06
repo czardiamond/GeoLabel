@@ -173,7 +173,7 @@ The API docs are at `http://localhost:8000/docs`. `/health` is a liveness check;
 | `GET` / `PUT` / `DELETE` | `/work/tasks/{id}/draft` | Assigned organization user | Recover, autosave/version, or discard an unsent contributor draft |
 | `GET` | `/work/tasks/{id}/annotation-history` | Task member / reviewer | Read immutable submitted image and video versions |
 | `POST` | `/work/tasks/{id}/video-segments` | Assigned organization user | Submit temporal segments and authored keyframe tracks |
-| `GET` | `/work/tasks/{id}/video-segments` and `/history` | Assigned contributor / reviewer | Read latest tracks and immutable video versions |
+| `GET` | `/work/tasks/{id}/video-segments` and `/history` | Assigned annotator (own submissions); owner/admin/reviewer/analyst (all submissions) | Read latest tracks and immutable video versions |
 | `POST` | `/work/tasks/{id}/review` | Reviewer/admin | Accept, reject or request rework |
 | `POST` | `/work/tasks/{id}/comments` | Task organization member | Add comment or issue |
 | `PUT` | `/work/tasks/{id}/gold-standard` | Reviewer/admin | Save independent reference data |
