@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import tempfile
 import hashlib
+from io import BytesIO
 import threading
 import warnings
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,12 @@ VIDEO_TYPES = {"video/mp4", "video/webm", "video/quicktime"}
 MAX_PREVIEW_EDGE = 1600
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_IMAGE_EDGE = 32_768
+MAX_SOURCE_WINDOW_PIXELS = 50_000_000
+MAX_WINDOW_OUTPUT_EDGE = 2048
+MAX_WINDOW_OUTPUT_PIXELS = 4_194_304
 _materialization_lock = threading.RLock()
+_display_range_cache: OrderedDict[tuple[Any, ...], list[list[float]]] = OrderedDict()
+_display_range_cache_lock = threading.Lock()
 
 
 def storage_root() -> Path:
@@ -118,6 +125,7 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
         indexes = [1, 2, 3] if dataset.count >= 3 else [1]
         bands = dataset.read(indexes, out_shape=(len(indexes), out_height, out_width), resampling=Resampling.average, masked=True)
         image_bands = []
+        display_minmax = []
         for band in bands:
             # Keep the mask separate: filling a masked integer array with NaN raises a dtype error.
             values = np.asarray(band.data, dtype=np.float64)
@@ -125,12 +133,14 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
             finite = values[valid]
             if not finite.size:
                 image_bands.append(np.zeros(values.shape, dtype=np.uint8))
+                display_minmax.append([0.0, 1.0])
                 continue
             low, high = np.nanpercentile(finite, [2, 98])
             if not math.isfinite(float(low)) or not math.isfinite(float(high)) or high <= low:
                 low, high = float(np.nanmin(finite)), float(np.nanmax(finite))
             if high <= low:
                 high = low + 1.0
+            display_minmax.append([float(low), float(high)])
             safe_values = np.where(valid, values, low)
             scaled = (safe_values - low) * (255.0 / (high - low))
             image_bands.append(np.clip(scaled, 0, 255).astype(np.uint8))
@@ -154,8 +164,126 @@ def _raster_preview(path: Path, output: Path) -> tuple[int, int, str | None, lis
             "band_descriptions": [description or None for description in dataset.descriptions],
             "nodata_values": nodata_values,
             "resolution": [float(value) for value in dataset.res],
+            "display_minmax": display_minmax,
         }
         return width, height, crs, bounds, transform, catalog_metadata
+
+
+def _raster_window_display_ranges(dataset: Any, path: Path, indexes: list[int],
+                                  metadata: dict[str, Any]) -> list[list[float]]:
+    recorded = metadata.get("display_minmax")
+    if isinstance(recorded, list) and len(recorded) >= len(indexes):
+        ranges = recorded[:len(indexes)]
+        if all(isinstance(pair, (list, tuple)) and len(pair) == 2
+               and all(isinstance(value, (int, float)) and math.isfinite(value) for value in pair)
+               and pair[1] > pair[0] for pair in ranges):
+            return [[float(pair[0]), float(pair[1])] for pair in ranges]
+
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, dataset.width, dataset.height, tuple(indexes))
+    with _display_range_cache_lock:
+        cached = _display_range_cache.get(key)
+        if cached is not None:
+            _display_range_cache.move_to_end(key)
+            return cached
+
+    import numpy as np
+    from rasterio.enums import Resampling
+
+    scale = min(1.0, MAX_PREVIEW_EDGE / max(dataset.width, dataset.height))
+    out_width = max(1, round(dataset.width * scale))
+    out_height = max(1, round(dataset.height * scale))
+    samples = dataset.read(indexes, out_shape=(len(indexes), out_height, out_width),
+                           resampling=Resampling.average, masked=True)
+    result: list[list[float]] = []
+    for band in samples:
+        values = np.asarray(band.data, dtype=np.float64)
+        valid = np.isfinite(values) & ~np.ma.getmaskarray(band)
+        finite = values[valid]
+        if not finite.size:
+            result.append([0.0, 1.0])
+            continue
+        low, high = np.nanpercentile(finite, [2, 98])
+        if not math.isfinite(float(low)) or not math.isfinite(float(high)) or high <= low:
+            low, high = float(np.nanmin(finite)), float(np.nanmax(finite))
+        if high <= low:
+            high = low + 1.0
+        result.append([float(low), float(high)])
+    with _display_range_cache_lock:
+        _display_range_cache[key] = result
+        _display_range_cache.move_to_end(key)
+        while len(_display_range_cache) > 64:
+            _display_range_cache.popitem(last=False)
+    return result
+
+
+def render_source_window(path: Path, content_type: str, x: int, y: int, width: int, height: int,
+                         output_width: int, output_height: int,
+                         metadata: dict[str, Any] | None = None) -> bytes:
+    """Render a bounded source-pixel window as PNG without materializing the full raster."""
+    values = (x, y, width, height, output_width, output_height)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        raise ValueError("Source-window coordinates and dimensions must be integers")
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise ValueError("Source window must have a non-negative origin and positive dimensions")
+    if width * height > MAX_SOURCE_WINDOW_PIXELS:
+        raise ValueError(f"Source window exceeds the {MAX_SOURCE_WINDOW_PIXELS:,}-pixel limit")
+    if (output_width <= 0 or output_height <= 0
+            or max(output_width, output_height) > MAX_WINDOW_OUTPUT_EDGE
+            or output_width * output_height > MAX_WINDOW_OUTPUT_PIXELS):
+        raise ValueError("Requested output dimensions exceed the safe source-window limit")
+
+    metadata = metadata or {}
+    is_tiff = content_type.lower().split(";", 1)[0].strip() in {"image/tiff", "image/geotiff"} \
+        or path.suffix.lower() in {".tif", ".tiff", ".cog"}
+    if is_tiff:
+        import numpy as np
+        import rasterio
+        from rasterio.enums import Resampling
+        from rasterio.windows import Window
+
+        with rasterio.open(path) as dataset:
+            if x + width > dataset.width or y + height > dataset.height:
+                raise ValueError("Source window lies outside the raster dimensions")
+            indexes = [1, 2, 3] if dataset.count >= 3 else [1]
+            display_ranges = _raster_window_display_ranges(dataset, path, indexes, metadata)
+            bands = dataset.read(
+                indexes,
+                window=Window(x, y, width, height),
+                out_shape=(len(indexes), output_height, output_width),
+                resampling=Resampling.average,
+                masked=True,
+            )
+        rendered_bands = []
+        for channel, band in enumerate(bands):
+            values_array = np.asarray(band.data, dtype=np.float64)
+            valid = np.isfinite(values_array) & ~np.ma.getmaskarray(band)
+            finite = values_array[valid]
+            if not finite.size:
+                rendered_bands.append(np.zeros(values_array.shape, dtype=np.uint8))
+                continue
+            low, high = display_ranges[channel]
+            safe_values = np.where(valid, values_array, low)
+            rendered_bands.append(np.clip((safe_values - low) * (255.0 / (high - low)), 0, 255).astype(np.uint8))
+        if len(rendered_bands) == 1:
+            image = Image.fromarray(rendered_bands[0], mode="L").convert("RGB")
+        else:
+            image = Image.fromarray(np.stack(rendered_bands[:3], axis=-1), mode="RGB")
+    else:
+        try:
+            with Image.open(path) as opened:
+                source = ImageOps.exif_transpose(opened).convert("RGB")
+                if x + width > source.width or y + height > source.height:
+                    raise ValueError("Source window lies outside the image dimensions")
+                image = source.crop((x, y, x + width, y + height))
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError("The source image window could not be decoded") from exc
+
+    if image.size != (output_width, output_height):
+        image = image.resize((output_width, output_height), Image.Resampling.LANCZOS)
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def inspect_and_preview(path: Path, filename: str, content_type: str, crs_value: str | None,

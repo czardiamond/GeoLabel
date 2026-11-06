@@ -31,6 +31,7 @@ from backend.asset_storage import (
     make_storage_paths,
     new_temp_path,
     parse_bounds,
+    render_source_window,
     resolve_storage_key,
     safe_filename,
     save_temp_asset,
@@ -1394,6 +1395,48 @@ def work_task_asset_preview(task_id: str, member: MemberContext = Depends(requir
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Asset preview file is missing from configured storage.")
     return FileResponse(path, media_type="image/png", filename=f"{asset.id}-preview.png")
+
+
+@router.get("/work/tasks/{task_id}/asset/window")
+def work_task_asset_window(
+    task_id: str,
+    x: int = Query(ge=0),
+    y: int = Query(ge=0),
+    width: int = Query(gt=0),
+    height: int = Query(gt=0),
+    output_width: int = Query(gt=0),
+    output_height: int = Query(gt=0),
+    member: MemberContext = Depends(require_member),
+    db: Session = Depends(get_db),
+):
+    """Render a source-pixel window for an assigned task without exposing its storage key."""
+    task, membership = _task_for_member(db, task_id, member)
+    _require_task_assignment(task, membership, member, db)
+    asset = _task_asset(task, db)
+    if asset.kind != "image" or not asset.width or not asset.height:
+        raise HTTPException(status_code=415, detail="Source windows are available only for image assets.")
+    if x + width > asset.width or y + height > asset.height:
+        raise HTTPException(status_code=422, detail="Source window lies outside the image dimensions.")
+    path = resolve_storage_key(asset.storage_key)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Asset file is missing from configured storage.")
+    try:
+        content = render_source_window(
+            path, asset.content_type, x, y, width, height, output_width, output_height,
+            asset.asset_metadata,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(
+        content=content,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-GeoLabel-Source-Window": f"{x},{y},{width},{height}",
+            "X-GeoLabel-Source-Size": f"{asset.width},{asset.height}",
+            "X-GeoLabel-Output-Size": f"{output_width},{output_height}",
+        },
+    )
 
 
 @router.get("/work/tasks/{task_id}/asset/content")

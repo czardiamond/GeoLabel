@@ -4,7 +4,8 @@ import numpy as np
 import rasterio
 from PIL import Image
 from rasterio.io import MemoryFile
-from rasterio.transform import from_origin
+from rasterio.transform import from_origin, Affine
+from rasterio.windows import Window
 
 from conftest import SERVICE_KEY
 
@@ -59,6 +60,27 @@ def geotiff_uint16_masked_bytes():
     return output.getvalue()
 
 
+def write_large_geotiff(path):
+    width = height = 10_980
+    patch_x, patch_y = 10_000, 10_100
+    transform = Affine(10, 2, 500_000, 3, -10, 800_000)
+    with rasterio.open(
+        path, "w", driver="GTiff", width=width, height=height, count=3,
+        dtype="uint8", crs="EPSG:32631", transform=transform,
+        tiled=True, blockxsize=512, blockysize=512, compress="deflate",
+    ) as dataset:
+        for row in range(0, height, 512):
+            row_height = min(512, height - row)
+            values = np.full((3, row_height, width), 100, dtype="uint8")
+            dataset.write(values, window=Window(0, row, width, row_height))
+        known = np.empty((3, 32, 32), dtype="uint8")
+        known[0] = np.arange(32 * 32, dtype=np.uint16).reshape(32, 32) % 254 + 1
+        known[1] = 80
+        known[2] = 160
+        known[:, 17, 16] = [42, 80, 160]
+        dataset.write(known, window=Window(patch_x, patch_y, 32, 32))
+
+
 def test_uint16_masked_geotiff_upload_serves_generated_preview(api_client, tmp_path, monkeypatch):
     client, _ = api_client
     from backend.config import settings
@@ -88,6 +110,63 @@ def test_uint16_masked_geotiff_upload_serves_generated_preview(api_client, tmp_p
     with Image.open(BytesIO(preview.content)) as image:
         assert image.mode == "RGB"
         assert image.size == (16, 12)
+
+
+def test_large_geotiff_source_window_endpoint_uses_uploaded_source_and_display_metadata(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ASSET_STORAGE_DIR", str(tmp_path / "large-source-assets"))
+    organization, _, owner_headers = create_org_and_owner(client, "Large raster windows", "large-window-owner@example.com")
+    project = client.post(f"/organizations/{organization['id']}/projects", headers=owner_headers,
+                          json={"name": "Full-resolution imagery", "description": ""})
+    assert project.status_code == 201, project.text
+    dataset = client.post(f"/projects/{project.json()['id']}/datasets", headers=owner_headers,
+                          json={"name": "Large scenes", "description": ""})
+    assert dataset.status_code == 201, dataset.text
+
+    source = tmp_path / "large_georeferenced_scene.tif"
+    write_large_geotiff(source)
+    upload = client.post(
+        f"/datasets/{dataset.json()['id']}/assets",
+        headers=owner_headers,
+        files={"file": (source.name, source.read_bytes(), "image/tiff")},
+    )
+    assert upload.status_code == 201, upload.text
+    asset = upload.json()
+    assert (asset["width"], asset["height"]) == (10_980, 10_980)
+    assert all(high > low for low, high in asset["metadata"]["display_minmax"])
+
+    task = client.post(
+        f"/projects/{project.json()['id']}/tasks", headers=owner_headers, json={
+            "title": "Full-resolution source window", "dataset_id": dataset.json()["id"],
+            "asset_id": asset["id"], "crs": "EPSG:32631", "taxonomy": ["building"],
+            "target_annotator_count": 1,
+        },
+    )
+    assert task.status_code == 201, task.text
+    response = client.get(
+        f"/work/tasks/{task.json()['id']}/asset/window"
+        "?x=10016&y=10117&width=1&height=1&output_width=1&output_height=1",
+        headers=owner_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["x-geolabel-source-window"] == "10016,10117,1,1"
+    assert response.headers["x-geolabel-source-size"] == "10980,10980"
+    with Image.open(BytesIO(response.content)) as window:
+        assert window.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
+    outside = client.get(
+        f"/work/tasks/{task.json()['id']}/asset/window"
+        "?x=10980&y=0&width=1&height=1&output_width=1&output_height=1",
+        headers=owner_headers,
+    )
+    assert outside.status_code == 422
+    over_budget = client.get(
+        f"/work/tasks/{task.json()['id']}/asset/window"
+        "?x=0&y=0&width=10000&height=6000&output_width=1&output_height=1",
+        headers=owner_headers,
+    )
+    assert over_budget.status_code == 422
 
 
 def polygon_collection(category="building", shift=0.0):
@@ -180,6 +259,8 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     })
     other_headers = {"Authorization": f"Bearer {other_worker.json()['access_token']}"}
     assert client.get(f"/work/tasks/{task['id']}/asset/preview", headers=other_headers).status_code == 403
+    window_query = "?x=0&y=0&width=4&height=4&output_width=8&output_height=8"
+    assert client.get(f"/work/tasks/{task['id']}/asset/window{window_query}", headers=other_headers).status_code == 403
     assert client.get(f"/assets/{asset['id']}/content", headers=other_headers).status_code == 403
     assert client.get(f"/datasets/{dataset['id']}/assets", headers=other_headers).json() == []
     reassigned = client.post(f"/work/tasks/{task['id']}/assign", headers=owner_headers,
@@ -198,6 +279,13 @@ def test_local_org_roles_and_full_asset_to_review_workflow(api_client, tmp_path,
     assert reservation.json()["reserved_by_user_id"] == worker_response.json()["user"]["id"]
     worker_preview = client.get(f"/work/tasks/{task['id']}/asset/preview", headers=worker_headers)
     assert worker_preview.status_code == 200
+    source_window = client.get(f"/work/tasks/{task['id']}/asset/window{window_query}", headers=worker_headers)
+    assert source_window.status_code == 200, source_window.text
+    assert source_window.headers["content-type"] == "image/png"
+    assert source_window.headers["x-geolabel-source-size"] == "4,4"
+    assert source_window.headers["x-geolabel-source-window"] == "0,0,4,4"
+    with Image.open(BytesIO(source_window.content)) as rendered_window:
+        assert rendered_window.size == (8, 8)
 
     empty_gold = client.get(f"/work/tasks/{task['id']}/gold-standard", headers=owner_headers)
     assert empty_gold.status_code == 200
